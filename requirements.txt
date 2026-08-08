@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+fastapi
+uvicorn[standard]
+huggingface-hub
+pydantic
+python-multipart
+silero-vad
+websockets
+requests
+numpy
+ctranslate2>=4.5.0
+aiohttp
+psutil
+git+https://github.com/LATICE-AI/whisper-s2t.git
