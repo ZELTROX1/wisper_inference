@@ -14,7 +14,11 @@ SRC_MODEL="${1:?usage: convert_to_ct2.sh <hf_repo_id> <output_dir> [quantization
 OUT_DIR="${2:?usage: convert_to_ct2.sh <hf_repo_id> <output_dir> [quantization]}"
 QUANT="${3:-float16}"   # float16 (fastest on modern GPUs), int8_float16 (smaller/cheaper), int8 (CPU)
 
-pip show ctranslate2 >/dev/null 2>&1 || pip install "ctranslate2>=4.5.0"
+pip show ctranslate2 >/dev/null 2>&1 || pip install ctranslate2==4.6.0
+# Converter loads the source checkpoint via transformers+torch, so both must be
+# present even if you haven't installed the rest of requirements.txt yet.
+pip show torch >/dev/null 2>&1 || pip install torch --extra-index-url https://download.pytorch.org/whl/cu128
+pip show transformers >/dev/null 2>&1 || pip install transformers accelerate
 
 ct2-transformers-converter \
     --model "$SRC_MODEL" \

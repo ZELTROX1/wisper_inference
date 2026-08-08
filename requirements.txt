@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.8.0
-torchaudio==2.8.0
+torch>=2.8,<2.10
+torchaudio>=2.8,<2.10
 fastapi
 uvicorn[standard]
 huggingface-hub
@@ -10,7 +10,6 @@ silero-vad
 websockets
 requests
 numpy
-ctranslate2>=4.5.0
 aiohttp
 psutil
 git+https://github.com/LATICE-AI/whisper-s2t.git

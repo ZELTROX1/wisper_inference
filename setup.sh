@@ -1,7 +1,7 @@
 #!/bin/bash
 
 python3 -m venv /opt/venv --system-site-packages
-source /opt/venv/bin/activate
+. /opt/venv/bin/activate
 
 # Install dependencies
 # pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
