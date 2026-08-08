@@ -11,6 +11,13 @@ python3 -m venv /opt/venv --system-site-packages
 
 sudo apt update && sudo apt install -y lsof ffmpeg
 
+# .env is never auto-loaded by main.py/quota_manager.py — export it here.
+if [ -f .env ]; then
+    set -a
+    . ./.env
+    set +a
+fi
+
 
 # # Wait for VAST_TCP_PORT_8080 environment variable to be available
 # echo "Waiting for VAST_TCP_PORT_8080 environment variable..."
