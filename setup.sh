@@ -11,7 +11,7 @@ python3 -m venv /opt/venv --system-site-packages
 
 sudo apt update && sudo apt install -y lsof ffmpeg
 
-# .env is never auto-loaded by main.py/quota_manager.py — export it here.
+# Load .env so the Python process sees the same configuration values.
 if [ -f .env ]; then
     set -a
     . ./.env

@@ -1,8 +1,12 @@
+import os
 from fastapi import FastAPI
 from transcribe import router as transcribe_router
 from streaming import router as streaming_router
 from warmup import health_tick
 from quota_manager import GPUQuotaManager
+from env_loader import load_env_file
+
+load_env_file()
 
 app = FastAPI(title="Whisper S2T Ultra Low-Latency", version="2.0.0")
 

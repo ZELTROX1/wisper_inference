@@ -89,9 +89,12 @@ Then set in `.env`:
 ```
 LOCAL_MODE=true
 LOCAL_MODEL_REPO_ID=./models/tara-ct2
+HUGGINGFACE_TOKEN=your_token_here
+DEFAULT_API_KEY=local
+DEFAULT_MODEL_ID=local-model
 ```
 
-`sh setup.sh` as usual. `/transcribe` and `/stream` work with any api-key/model-id header value.
+`sh setup.sh` as usual. `/transcribe` and `/stream` now work with either explicit headers or these local defaults, so you can use the repo without the old Latice backend key.
 
 ## Benchmarking latency & cost
 

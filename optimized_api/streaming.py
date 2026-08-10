@@ -2,6 +2,8 @@ import json, time, os, wave, tempfile, asyncio, numpy as np, torch, base64, rand
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from silero_vad import load_silero_vad
 
+from request_context import resolve_request_context
+
 router = APIRouter()
 
 _VAD_MODEL = load_silero_vad()
@@ -35,10 +37,7 @@ async def stream_audio(websocket: WebSocket):
 
     api_key = websocket.headers.get("api-key")
     model_id = websocket.headers.get("model-id")
-    if not api_key or not model_id:
-        await websocket.send_text(json.dumps({"type": "error", "error": "Missing api-key or model-id header"}))
-        await websocket.close(code=4403)
-        return
+    api_key, model_id = resolve_request_context(api_key, model_id)
 
     try:
         gpu_quota_manager = websocket.app.state.gpu_quota_manager
