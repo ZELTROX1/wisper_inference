@@ -2,8 +2,6 @@ import json, time, os, wave, tempfile, asyncio, numpy as np, torch, base64, rand
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from silero_vad import load_silero_vad
 
-from request_context import resolve_request_context
-
 router = APIRouter()
 
 _VAD_MODEL = load_silero_vad()
@@ -35,25 +33,7 @@ async def stream_audio(websocket: WebSocket):
     
     stream_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
 
-    api_key = websocket.headers.get("api-key")
-    model_id = websocket.headers.get("model-id")
-    api_key, model_id = resolve_request_context(api_key, model_id)
-
-    try:
-        gpu_quota_manager = websocket.app.state.gpu_quota_manager
-        if not gpu_quota_manager.can_transcribe(api_key, 1000):
-            await websocket.send_text(json.dumps({"type": "error", "error": f"Insufficient quota. Required: 1000ms, Available: {gpu_quota_manager.get_available_milliseconds(api_key)}ms"}))
-            await websocket.close(code=402)
-            return
-        repo_id = gpu_quota_manager.resolve_repo_id(api_key, model_id)
-        if not repo_id:
-            raise RuntimeError(f"Model ID {model_id} not found for this user")
-    except Exception as e:
-        await websocket.send_text(json.dumps({"type": "error", "error": str(e)}))
-        await websocket.close(code=4500)
-        return
-
-    batcher = gpu_quota_manager.get_batcher(repo_id)
+    batcher = websocket.app.state.batcher
 
     sample_rate = int(websocket.headers.get("sample-rate", "8000"))
     vad_threshold = float(websocket.headers.get('vad-threshold', '0.3'))
@@ -69,11 +49,9 @@ async def stream_audio(websocket: WebSocket):
     last_good_prob = False
     last_wav_base64 = None
     warm_launched = False
-    total_streamed_bytes = 0
     last_infer_ms = 0
     have_spoke = False
     stt_task = None
-    requested_at = time.time()
     temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     temp_path = temp_wav.name
     temp_wav.close()
@@ -162,7 +140,6 @@ async def stream_audio(websocket: WebSocket):
                 vad_prob_value = vad_prob(chunk, sample_rate)
                 is_speaking = vad_prob_value > vad_threshold
                 print(f"[{stream_id}] VAD: {vad_prob_value:.3f}")
-                total_streamed_bytes += len(chunk)
                 audio_buffer.extend(chunk)
                 
                 if is_speaking:
@@ -199,19 +176,3 @@ async def stream_audio(websocket: WebSocket):
                 os.unlink(temp_path)
         except Exception:
             pass
-        try:
-            if api_key:
-                duration_ms = int((total_streamed_bytes / (sample_rate * 2)) * 1000.0)
-                if duration_ms > 0:
-                    gpu_quota_manager.consume_quota(api_key, duration_ms)
-                    cost = (duration_ms / 1000) * 0.00015
-                    gpu_quota_manager.record_usage(
-                        api_key=api_key,
-                        cost=cost,
-                        duration_seconds=duration_ms / 1000,
-                        latency_ms=last_infer_ms,
-                        requested_at=requested_at,
-                        streaming=True
-                    )
-        except Exception as e:
-            print(f"[{stream_id}] Error recording usage (stream): {e}")

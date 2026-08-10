@@ -4,17 +4,11 @@ import requests
 import uuid
 import time
 
-def test_latice(audio_bytes, api_url=None, api_key=None, model_id=None):
+def test_transcribe(audio_bytes, api_url=None):
     """Sends audio file to transcription API and returns transcription."""
     api_url = api_url or os.getenv("API_URL", "http://localhost:8080/transcribe")
-    api_key = api_key or os.getenv("API_KEY", "your-api-key-here")
-    model_id = model_id or os.getenv("MODEL_ID", "your-model-id-here")
-    
-    headers = {
-        "API-Key": api_key,
-        "Accept": "application/json",
-        "Model-Id": model_id
-    }
+
+    headers = {"Accept": "application/json"}
     files = {
         "audio_file": (f"audio_{uuid.uuid4()}.mp3", audio_bytes, "audio/mp3")
     }
@@ -26,7 +20,7 @@ def test_latice(audio_bytes, api_url=None, api_key=None, model_id=None):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python test_indu.py <audio_file_path> [num_tests]")
-        print("Or set environment variables: API_URL, API_KEY, MODEL_ID")
+        print("Or set environment variable: API_URL")
         sys.exit(1)
     
     audio_path = sys.argv[1]
@@ -43,7 +37,7 @@ if __name__ == "__main__":
         
         start_time = time.time()
         try:
-            transcription = test_latice(audio_bytes)
+            transcription = test_transcribe(audio_bytes)
             latency = time.time() - start_time
             latencies.append(latency)
             print(f"Test {i+1}: {latency:.3f}s - {transcription[:50]}...")

@@ -9,8 +9,6 @@ import websockets
 
 # Config
 API_URL = os.getenv("WS_API_URL", "ws://localhost:8080/stream")
-API_KEY = os.getenv("API_KEY", "your-api-key-here")
-MODEL_ID = os.getenv("MODEL_ID", "your-model-id-here")
 LANGUAGE = os.getenv("LANGUAGE", "fr")
 AUDIO_DIR = os.getenv("AUDIO_DIR", "./audio_samples/")
 OUT_RATE = int(os.getenv("SAMPLE_RATE", "8000"))  # VAD supports 8000 or 16000
@@ -59,8 +57,6 @@ async def run_test(test_id, wav_path=None):
 
     uri = API_URL
     headers = [
-        ("api-key", API_KEY),
-        ("model-id", MODEL_ID),
         ("sample-rate", str(OUT_RATE)),
         ("language", LANGUAGE),
     ]

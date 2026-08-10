@@ -15,32 +15,22 @@ def _generate_silent_wav_bytes(duration_seconds: float = 0.2, sample_rate: int =
         wav_file.writeframes(silent_frames)
     return buf.getvalue()
 
-async def _warm_model(app, repo_id: str):
-    batcher = app.state.gpu_quota_manager.get_batcher(repo_id)
-    try:
-        wav_bytes = _generate_silent_wav_bytes()
-        await batcher.enqueue(wav_bytes)
-        print(f"Warmed {repo_id}")
-    except Exception:
-        pass
-
-async def _warm_all_models(app):
+async def _warm_model(app):
     global _warm_in_progress, _warm_last_ts
     if _warm_in_progress:
         return
     _warm_in_progress = True
     try:
-        repo_ids = app.state.gpu_quota_manager.get_all_existing_models()
-        print(f"Warming {len(repo_ids)} models")
-        for rid in repo_ids:
-            await _warm_model(app, rid)
+        wav_bytes = _generate_silent_wav_bytes()
+        await app.state.batcher.enqueue(wav_bytes)
+        print("Model warmed")
+    except Exception as e:
+        print(f"Warmup error: {e}")
     finally:
         _warm_last_ts = time.time()
         _warm_in_progress = False
 
 async def health_tick(app):
     now = time.time()
-    print(f"Health tick: {now} - {_warm_last_ts} >= {_warm_interval_s} and not _warm_in_progress: {_warm_in_progress}")
     if (now - _warm_last_ts) >= _warm_interval_s and not _warm_in_progress:
-        asyncio.create_task(_warm_all_models(app))
-
+        asyncio.create_task(_warm_model(app))

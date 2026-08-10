@@ -41,7 +41,6 @@ RUN /opt/venv/bin/pip install --no-cache-dir \
         python-multipart \
         silero-vad \
         websockets \
-        requests \
         numpy \
     && rm -rf /tmp/* /var/tmp/* ~/.cache/pip
 

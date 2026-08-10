@@ -16,12 +16,11 @@ class EnvLoaderTests(unittest.TestCase):
     def test_load_env_file_populates_missing_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
-            env_path.write_text("LOCAL_MODE=true\nLOCAL_MODEL_REPO_ID=demo/model\n")
+            env_path.write_text("MODEL_REPO_ID=demo/model\n")
             with unittest.mock.patch.dict(os.environ, {}, clear=True):
                 loaded = load_env_file(env_path)
                 self.assertTrue(loaded)
-                self.assertEqual(os.environ["LOCAL_MODE"], "true")
-                self.assertEqual(os.environ["LOCAL_MODEL_REPO_ID"], "demo/model")
+                self.assertEqual(os.environ["MODEL_REPO_ID"], "demo/model")
 
 
 if __name__ == "__main__":

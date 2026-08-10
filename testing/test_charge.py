@@ -15,22 +15,18 @@ logger = logging.getLogger("load_test")
 
 # API URL - can be overridden via environment variable
 API_URL = os.getenv("API_URL", "http://localhost:8080/transcribe")
-API_KEY = os.getenv("API_KEY", "your-api-key-here")
-MODEL_ID = os.getenv("MODEL_ID", "your-model-id-here")
 
 # Concurrency levels to test - can be overridden via environment variable
 CONCURRENCY_LEVELS_STR = os.getenv("CONCURRENCY_LEVELS", "3,5,7,9,10,12,14")
 CONCURRENCY_LEVELS = [int(x.strip()) for x in CONCURRENCY_LEVELS_STR.split(",")]
 
 
-async def transcribe_audio_async(session: aiohttp.ClientSession, audio_bytes: bytes, audio_name: str, api_key: str = None, model_id: str = None) -> Dict:
+async def transcribe_audio_async(session: aiohttp.ClientSession, audio_bytes: bytes, audio_name: str) -> Dict:
     """
     Sends audio file to transcription API and measures latency
     """
     start_time = time.time()
-    api_key = api_key or API_KEY
-    model_id = model_id or MODEL_ID
-    
+
     try:
         # Prepare multipart form data
         form_data = aiohttp.FormData()
@@ -40,13 +36,8 @@ async def transcribe_audio_async(session: aiohttp.ClientSession, audio_bytes: by
             filename=f"audio_{uuid.uuid4()}.wav",
             content_type='audio/wav'
         )
-        
-        # Send request
-        headers = {
-            "api-key": api_key,
-            "Accept": "application/json",
-            "model-id": model_id
-        }
+
+        headers = {"Accept": "application/json"}
 
         async with session.post(f"{API_URL}", data=form_data, headers=headers) as response:
             end_time = time.time()

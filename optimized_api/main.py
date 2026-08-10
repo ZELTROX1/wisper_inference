@@ -3,7 +3,8 @@ from fastapi import FastAPI
 from transcribe import router as transcribe_router
 from streaming import router as streaming_router
 from warmup import health_tick
-from quota_manager import GPUQuotaManager
+from model_manager import get_model
+from batcher import CoalescingBatcher
 from env_loader import load_env_file
 
 load_env_file()
@@ -14,13 +15,13 @@ app = FastAPI(title="Whisper S2T Ultra Low-Latency", version="2.0.0")
 app.include_router(transcribe_router)
 app.include_router(streaming_router)
 
-# Shared global state
-app.state.gpu_quota_manager = GPUQuotaManager()
+# Single model loaded once at startup, shared by every request.
+MODEL_REPO_ID = os.getenv("MODEL_REPO_ID", "./models/tara-ct2")
+model = get_model(MODEL_REPO_ID)
+app.state.batcher = CoalescingBatcher(model)
 
 @app.get("/health")
 async def health():
-    # Flush usage records for all users (checks if > 1min since last send)
-    app.state.gpu_quota_manager._flush_usage_records()
     await health_tick(app)
     return {"status": "ok"}
 

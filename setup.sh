@@ -4,10 +4,7 @@ python3 -m venv /opt/venv --system-site-packages
 . /opt/venv/bin/activate
 
 # Install dependencies
-# pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-# pip install torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-# pip install git+https://github.com/LATICE-AI/whisper-s2t.git
-# pip install fastapi uvicorn huggingface-hub pydantic python-multipart silero-vad websockets
+# pip install -r requirements.txt
 
 sudo apt update && sudo apt install -y lsof ffmpeg
 

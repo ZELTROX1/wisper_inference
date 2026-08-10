@@ -5,8 +5,6 @@ import pyaudio
 
 import os
 API_URL = os.getenv("WS_API_URL", "ws://localhost:8080/stream")
-API_KEY = os.getenv("API_KEY", "your-api-key-here")
-MODEL_ID = os.getenv("MODEL_ID", "your-model-id-here")
 SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "8000"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1600"))
 
@@ -22,8 +20,6 @@ async def stream_from_microphone():
         frames_per_buffer=CHUNK_SIZE
     )
     headers = [
-        ("api-key", API_KEY),
-        ("model-id", MODEL_ID),
         ("sample-rate", str(SAMPLE_RATE))
     ]
     try:
