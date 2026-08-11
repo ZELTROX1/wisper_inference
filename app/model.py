@@ -1,4 +1,9 @@
-"""Faster-whisper model + Tara mixed-code prompt."""
+"""Faster-whisper model + Tara mixed-code prompt.
+
+Hallucination control is architectural where possible:
+  - client only sends speech windows
+  - here we refuse to invent text on silence / no-speech / impossible density
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import os
 import re
 import time
 import wave
+from collections import Counter
 from typing import List, Optional
 
 import numpy as np
@@ -18,6 +24,18 @@ MIXEDCODE = "<|mixedcode|>"
 
 _model: WhisperModel | None = None
 _warmed = False
+
+# Phrases Whisper invents on noise in Indic telephony (seen in production logs).
+_HALLUCINATION_MARKERS = (
+    "दीनदयाल",
+    "दीन दयाल",
+    "ग्रामीण कौशल",
+    "प्रतिक्रिया के लिए संस्कृति",
+    "विशिष्टता को समर्थन",
+    "subscribe",
+    "thanks for watching",
+    "sous-titrage",
+)
 
 
 def enable_mixedcode(model: WhisperModel) -> None:
@@ -98,11 +116,9 @@ def get_model() -> WhisperModel:
 
 
 def warmup() -> None:
-    """Run a tiny silent decode so the first real utterance is not cold (~9s)."""
     global _warmed
     if _warmed:
         return
-    # 0.5s silence @ 16 kHz
     silence = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
     model = get_model()
     t0 = time.time()
@@ -151,8 +167,20 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def rms_energy(wave_f: np.ndarray) -> float:
+    if wave_f.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(wave_f), dtype=np.float64)))
+
+
+def has_speech_energy(wave_f: np.ndarray) -> bool:
+    """True if waveform is loud enough to be speech (not silence/noise floor)."""
+    # Absolute RMS gate — silence / line noise fails; real speech passes.
+    # Tuned for 16-bit PCM normalized to [-1, 1].
+    return rms_energy(wave_f) >= 0.01
+
+
 def collapse_repeats(text: str, max_run: int = 2) -> str:
-    """Collapse 'पटना पटना पटना' → 'पटना पटना' (max_run copies)."""
     words = text.split()
     if not words:
         return text
@@ -173,14 +201,38 @@ def collapse_repeats(text: str, max_run: int = 2) -> str:
 
 
 def is_repeat_loop(text: str, ratio: float = 0.45) -> bool:
-    """True if one word dominates the transcript (Whisper loop)."""
     words = [w.lower() for w in text.split() if w.strip()]
     if len(words) < 6:
         return False
-    from collections import Counter
-
     _word, count = Counter(words).most_common(1)[0]
     return (count / len(words)) >= ratio
+
+
+def is_impossible_density(text: str, duration_s: float) -> bool:
+    """Reject when model dumps more words than a human could have spoken."""
+    if duration_s <= 0:
+        return True
+    words = text.split()
+    if not words:
+        return False
+    # ~4 words/sec is already fast speech; above that is invented text on noise.
+    return (len(words) / duration_s) > 4.5
+
+
+def looks_like_known_hallucination(text: str) -> bool:
+    low = text.lower()
+    return any(m.lower() in low for m in _HALLUCINATION_MARKERS)
+
+
+def _empty_result(language: str, infer_ms: float = 0.0) -> dict:
+    return {
+        "text": "",
+        "language": language,
+        "avg_logprob": 0.0,
+        "infer_ms": infer_ms,
+        "good_prob": False,
+        "no_speech": True,
+    }
 
 
 def transcribe(
@@ -188,17 +240,18 @@ def transcribe(
     language: str = "hi",
     sample_rate: int = SAMPLE_RATE,
 ) -> dict:
-    """Run ASR. `audio` = WAV bytes or raw PCM16LE mono."""
+    """Run ASR. Returns empty text when input is silence or model is inventing."""
     model = get_model()
     wave_f = _to_float32(audio, sample_rate)
     if wave_f.size == 0:
-        return {
-            "text": "",
-            "language": language,
-            "avg_logprob": 0.0,
-            "infer_ms": 0.0,
-            "good_prob": False,
-        }
+        return _empty_result(language)
+
+    duration_s = float(wave_f.size) / float(sample_rate)
+
+    # Do not call the decoder on silence — Whisper invents long Hindi phrases.
+    if not has_speech_energy(wave_f):
+        print(f"skip decode: low energy rms={rms_energy(wave_f):.5f} dur={duration_s:.2f}s")
+        return _empty_result(language)
 
     vad_filter = os.getenv("CLIP_VAD_FILTER", "true").lower() in ("1", "true", "yes")
     beam = int(os.getenv("BEAM_SIZE", "5"))
@@ -214,19 +267,33 @@ def transcribe(
         without_timestamps=True,
         condition_on_previous_text=False,
         vad_filter=vad_filter,
-        compression_ratio_threshold=float(
-            os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4")
-        ),
-        no_speech_threshold=float(os.getenv("NO_SPEECH_THRESHOLD", "0.6")),
-        repetition_penalty=float(os.getenv("REPETITION_PENALTY", "1.1")),
-        no_repeat_ngram_size=int(os.getenv("NO_REPEAT_NGRAM", "3")),
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        repetition_penalty=1.15,
+        no_repeat_ngram_size=3,
     )
     segs = list(segments)
     infer_ms = (time.time() - t0) * 1000
 
+    if not segs:
+        return _empty_result(language, infer_ms)
+
+    # If every segment looks like no-speech, refuse the text.
+    if all(float(s.no_speech_prob or 0.0) >= 0.6 for s in segs):
+        print("skip decode: no_speech_prob high on all segments")
+        return _empty_result(language, infer_ms)
+
     texts, lps = [], []
     good = False
+    max_no_speech = 0.0
+    max_comp = 0.0
     for s in segs:
+        max_no_speech = max(max_no_speech, float(s.no_speech_prob or 0.0))
+        max_comp = max(max_comp, float(s.compression_ratio or 0.0))
+        # Drop individual segments that are themselves no-speech inventions
+        if float(s.no_speech_prob or 0.0) >= 0.6:
+            continue
         t = (s.text or "").strip()
         if t:
             texts.append(t)
@@ -241,11 +308,22 @@ def transcribe(
     text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
     text = collapse_repeats(text, max_run=2)
 
-    if is_repeat_loop(text):
-        # Extreme loop — keep first 3 unique-ish words only is useless; blank it.
-        print(f"repeat-loop rejected: {text[:80]!r}...")
-        text = ""
-        good = False
+    if not text:
+        return _empty_result(language, infer_ms)
+
+    if is_repeat_loop(text) or looks_like_known_hallucination(text):
+        print(f"hallucination rejected: {text[:100]!r}")
+        return _empty_result(language, infer_ms)
+
+    if is_impossible_density(text, duration_s):
+        print(
+            f"density rejected: {len(text.split())} words in {duration_s:.2f}s → {text[:80]!r}"
+        )
+        return _empty_result(language, infer_ms)
+
+    if max_comp >= 2.4:
+        print(f"compression_ratio rejected: {max_comp:.2f}")
+        return _empty_result(language, infer_ms)
 
     avg = float(sum(lps) / len(lps)) if lps else 0.0
     return {
@@ -254,4 +332,5 @@ def transcribe(
         "avg_logprob": avg,
         "infer_ms": infer_ms,
         "good_prob": good or (avg > -0.5 and bool(text)),
+        "no_speech": False,
     }

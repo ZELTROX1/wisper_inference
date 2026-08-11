@@ -1,18 +1,7 @@
-"""Tara faster-whisper STT — simple FastAPI service.
+"""Tara faster-whisper STT — speech-window only.
 
-Endpoints
-  GET  /health
-  POST /transcribe
-  WS   /stream   — client-VAD protocol (Pipecat-driven)
-
-WebSocket protocol
-------------------
-  Client → binary PCM16LE mono @ sample-rate (default 16 kHz)
-  Client → {"event":"finalize"}   end of utterance (VAD stop OR bot start)
-  Client → {"event":"clear"}      drop buffer without decoding (rare)
-  Client → "close"
-  Server → {"type":"transcription","text":...,"final":true,...}
-  Server → {"type":"error","error":...}
+Client must only send PCM during user speech (Pipecat VAD start→stop).
+Server refuses silence / hallucination decode.
 """
 
 from __future__ import annotations
@@ -42,7 +31,6 @@ if _env.exists():
 from app.model import (
     SAMPLE_RATE,
     collapse_repeats,
-    is_repeat_loop,
     load_model,
     pcm16_to_wav,
     transcribe,
@@ -51,22 +39,20 @@ from app.model import (
 
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKERS", "2")))
 MAX_UTTERANCE_S = float(os.getenv("MAX_UTTERANCE_S", "12"))
-MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.3"))
-MIN_FINAL_CHARS = int(os.getenv("MIN_FINAL_CHARS", "2"))
-LOGPROB_MIN = float(os.getenv("LOGPROB_THRESHOLD", "-0.55"))
+# With speech-only streaming, a real utterance is rarely under ~0.4s of speech.
+MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.35"))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_model()
-    # Warm CUDA kernels so first real finalize is not ~9s
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(_executor, warmup)
     yield
     _executor.shutdown(wait=False)
 
 
-app = FastAPI(title="Tara STT", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Tara STT", version="1.3.0", lifespan=lifespan)
 
 
 async def _run_asr(audio: bytes, language: str, sample_rate: int = SAMPLE_RATE) -> dict:
@@ -82,27 +68,9 @@ def _clean_text(text: str) -> str:
     return collapse_repeats(text, max_run=2)
 
 
-def _is_junk(text: str) -> bool:
-    t = _clean_text(text)
-    if len(t) < MIN_FINAL_CHARS:
-        return True
-    if re.fullmatch(r"[\W_]+", t, flags=re.UNICODE):
-        return True
-    words = t.split()
-    if len(words) >= 4 and len(set(w.lower() for w in words)) == 1:
-        return True
-    if is_repeat_loop(t):
-        return True
-    low = t.lower()
-    for s in ("subtitle", "sous-titrage", "thanks for watching", "www.", "subscribe"):
-        if s in low:
-            return True
-    return False
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mode": "client_vad", "version": "1.2.0"}
+    return {"status": "ok", "mode": "speech_window", "version": "1.3.0"}
 
 
 @app.post("/transcribe")
@@ -115,11 +83,8 @@ async def http_transcribe(
         return {"transcription": "", "error": "empty file"}
     lang = (language or "hi").strip().lower().replace("_", "-").split("-", 1)[0]
     result = await _run_asr(data, lang)
-    text = _clean_text(result["text"])
-    if _is_junk(text):
-        text = ""
     return {
-        "transcription": text,
+        "transcription": _clean_text(result.get("text") or ""),
         "language": result["language"],
         "avg_logprob": result["avg_logprob"],
         "infer_ms": result["infer_ms"],
@@ -128,7 +93,6 @@ async def http_transcribe(
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
-    """Buffer PCM until client sends finalize (Pipecat VAD / bot-start)."""
     await ws.accept()
 
     sid = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
@@ -142,19 +106,16 @@ async def stream(ws: WebSocket):
 
     buf = bytearray()
     lock = asyncio.Lock()
-    # Serialize decodes so two finalizes don't interleave
     decode_lock = asyncio.Lock()
 
-    print(f"[{sid}] open sr={sample_rate} lang={language} mode=client_vad")
+    print(f"[{sid}] open sr={sample_rate} lang={language} mode=speech_window")
 
     async def finalize_utterance(reason: str = "finalize") -> None:
         nonlocal buf
         async with decode_lock:
             async with lock:
                 if len(buf) < min_bytes:
-                    print(
-                        f"[{sid}] {reason} skipped (too short: {len(buf)} bytes)"
-                    )
+                    print(f"[{sid}] {reason} skip short buf={len(buf)}")
                     buf.clear()
                     return
                 snap = bytes(buf)
@@ -172,19 +133,17 @@ async def stream(ws: WebSocket):
                     pass
                 return
 
-            text = _clean_text(r["text"])
+            text = _clean_text(r.get("text") or "")
             wall = (time.time() - t0) * 1000
             print(
                 f"[{sid}] stt={text!r} lp={r['avg_logprob']:.3f} "
                 f"infer={r['infer_ms']:.0f}ms wall={wall:.0f}ms "
-                f"bytes={len(snap)} reason={reason}"
+                f"bytes={len(snap)} reason={reason} "
+                f"no_speech={r.get('no_speech')}"
             )
 
-            if _is_junk(text):
-                print(f"[{sid}] junk dropped reason={reason}")
-                return
-            if r["avg_logprob"] < LOGPROB_MIN and not r["good_prob"]:
-                print(f"[{sid}] low confidence dropped")
+            if not text or r.get("no_speech"):
+                print(f"[{sid}] empty/no_speech dropped")
                 return
 
             payload = {
@@ -236,7 +195,8 @@ async def stream(ws: WebSocket):
                     async with lock:
                         n = len(buf)
                         buf.clear()
-                    print(f"[{sid}] buffer cleared ({n} bytes dropped)")
+                    if n:
+                        print(f"[{sid}] cleared {n} bytes")
                 else:
                     print(f"[{sid}] ignore text: {raw[:80]!r}")
                 continue
