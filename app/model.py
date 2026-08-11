@@ -188,15 +188,32 @@ def strip_hallucination_tail(text: str) -> str:
 
 
 def is_useless_text(text: str) -> bool:
+    """Drop punctuation-only noise. Single words (हाँ / yes / ok) are valid."""
     t = text.strip()
     if not t:
         return True
-    # punctuation-only / single char garbage
     if re.fullmatch(r"[\W_]+", t, flags=re.UNICODE):
         return True
-    if len(t) == 1:
-        return True
     return False
+
+
+def _collect_text(
+    segs,
+    nsp_threshold: float,
+) -> tuple[str, list[float]]:
+    """Pipecat rule: keep segment when no_speech_prob < threshold."""
+    text_parts: list[str] = []
+    logprobs: list[float] = []
+    for segment in segs:
+        if segment.no_speech_prob < nsp_threshold:
+            part = (segment.text or "").strip()
+            if part:
+                text_parts.append(part)
+            if segment.avg_logprob is not None:
+                logprobs.append(float(segment.avg_logprob))
+    text = " ".join(text_parts).strip()
+    text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
+    return text, logprobs
 
 
 def _empty(language: str, infer_ms: float = 0.0) -> dict:
@@ -227,18 +244,18 @@ def transcribe(
         no_speech_prob if no_speech_prob is not None else DEFAULT_NO_SPEECH_PROB
     )
 
-    # Clip VAD: SegmentedSTT already cut speech, but pre-roll can be ~1s of
-    # silence/noise; stripping it reduces "दीनदयाल / coworking" junk.
-    use_clip_vad = os.getenv("CLIP_VAD_FILTER", "true").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    # Short utterances (single word / yes-no): clip VAD often eats the word
+    # inside the ~1s SegmentedSTT pre-roll. Prefer no clip VAD on short clips.
+    short_utt = duration_s < 2.5
+    env_vad = os.getenv("CLIP_VAD_FILTER", "true").lower() in ("1", "true", "yes")
+    use_clip_vad = env_vad and not short_utt
+    # Single-word clips often score no_speech_prob in 0.4–0.7; loosen filter.
+    if short_utt:
+        nsp_threshold = max(nsp_threshold, 0.75)
+
     beam = int(os.getenv("BEAM_SIZE", "5"))
 
     t0 = time.time()
-    # Structure matches Pipecat (language + float audio). Extra kwargs are the
-    # minimal set that keeps telephony from falling apart vs bare defaults.
     segments, _info = model.transcribe(
         audio_float,
         language=language or "hi",
@@ -257,34 +274,32 @@ def transcribe(
     segs = list(segments)
     infer_ms = (time.time() - t0) * 1000
 
-    # Pipecat: keep segment if no_speech_prob < threshold
-    text_parts: list[str] = []
-    logprobs: list[float] = []
-    for segment in segs:
-        if segment.no_speech_prob < nsp_threshold:
-            part = (segment.text or "").strip()
-            if part:
-                text_parts.append(part)
-            if segment.avg_logprob is not None:
-                logprobs.append(float(segment.avg_logprob))
-
-    text = " ".join(text_parts).strip()
-    text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
+    text, logprobs = _collect_text(segs, nsp_threshold)
     text = strip_hallucination_tail(text)
+
+    # Fallback: short clips emptied by strict nsp — take best non-empty segments
+    if not text and short_utt and segs:
+        text, logprobs = _collect_text(segs, nsp_threshold=0.9)
+        text = strip_hallucination_tail(text)
+        if text:
+            print(
+                f"short-utt fallback kept={text!r} dur={duration_s:.2f}s",
+                flush=True,
+            )
 
     if is_useless_text(text):
         print(
-            f"empty/useless after filter dur={duration_s:.2f}s segs={len(segs)}",
+            f"empty/useless after filter dur={duration_s:.2f}s segs={len(segs)} "
+            f"nsp_th={nsp_threshold} clip_vad={use_clip_vad}",
             flush=True,
         )
         return _empty(language, infer_ms)
 
-    # Pure junk left after strip
     if any(m.lower() in text.lower() for m in _HALLUCINATION_MARKERS):
         print(f"junk still present, drop: {text[:80]!r}", flush=True)
         return _empty(language, infer_ms)
 
-    # Impossible density = invented monologue on ~1s of audio
+    # Density guard only for long invented monologues (not 1–2 word answers)
     n_words = len(text.split())
     if duration_s > 0 and n_words / duration_s > 5.0 and n_words >= 12:
         print(
