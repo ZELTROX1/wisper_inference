@@ -1,18 +1,24 @@
-"""Faster-whisper / CTranslate2 backend for Tara.
+"""Tara faster-whisper inference — aligned with Pipecat WhisperSTTService.
 
-Why HF demo can look better than this path
-------------------------------------------
-HuggingFace Spaces use Transformers ``generate`` with a clean clip and
-``forced_decoder_ids`` (often mixed-code). This service:
+Pipecat source of truth
+-----------------------
+``pipecat.services.whisper.stt.WhisperSTTService.run_stt``:
 
-  1. Runs CTranslate2 (same weights if conversion was correct).
-  2. Streams telephony buffers that may include silence / noise around speech.
-  3. Used to **drop the whole transcript** when a known junk phrase appeared
-     anywhere — so real speech like "East Godavari Amalapuram" was deleted
-     when the model appended "दीनदयाल…कौशल योजना" after it.
+    audio_float = pcm_i16.astype(float32) / 32768.0
+    segments, _ = model.transcribe(audio_float, language=language)
+    for segment in segments:
+        if segment.no_speech_prob < no_speech_prob:   # default 0.4
+            text += segment.text
 
-We now **strip** hallucination tails and keep the real prefix, and use
-decode settings closer to a simple HF generate call.
+That is intentionally minimal: no beam/penalty maze. Pipeline VAD
+(SegmentedSTTService) already cuts the utterance; the model only decodes
+one clean clip.
+
+Tara-only extras
+----------------
+  * load CT2 path from MODEL_PATH
+  * inject ``<|mixedcode|>`` for Hinglish (optional, MIXED_CODE=true)
+  * strip known junk tails (दीनदयाल / कौशल योजना) so real place names stay
 """
 
 from __future__ import annotations
@@ -22,7 +28,6 @@ import os
 import re
 import time
 import wave
-from collections import Counter
 from typing import List, Optional
 
 import numpy as np
@@ -32,11 +37,13 @@ from faster_whisper.tokenizer import Tokenizer
 SAMPLE_RATE = 16_000
 MIXEDCODE = "<|mixedcode|>"
 
+# Pipecat WhisperSTTSettings default
+DEFAULT_NO_SPEECH_PROB = 0.4
+
 _model: WhisperModel | None = None
 _warmed = False
 
-# Junk Whisper/Tara often appends after real speech on noisy telephony clips.
-# Match case-insensitively; we cut from the first hit and keep the prefix.
+# Junk often appended after real speech on noisy telephony (not on clean HF demos).
 _HALLUCINATION_MARKERS = (
     "प्रतिक्रिया के लिए संस्कृति",
     "दीनदयाल",
@@ -52,7 +59,7 @@ _HALLUCINATION_MARKERS = (
 
 
 def enable_mixedcode(model: WhisperModel) -> None:
-    """Inject <|mixedcode|> after language token (Tara Hinglish mode)."""
+    """Tara mixed-code: sot → language → <|mixedcode|> → task → …"""
 
     def get_prompt(
         tokenizer: Tokenizer,
@@ -113,12 +120,11 @@ def load_model() -> WhisperModel:
     mixed = os.getenv("MIXED_CODE", "true").lower() in ("1", "true", "yes")
 
     print(f"Loading {path} device={device} compute_type={compute_type}")
+    # Same constructor style as Pipecat WhisperSTTService._load
     model = WhisperModel(path, device=device, compute_type=compute_type)
     if mixed:
         enable_mixedcode(model)
         print("mixed-code ON")
-    else:
-        print("mixed-code OFF (pure language token only — closer to plain HF hi mode)")
     _model = model
     print("model ready")
     return model
@@ -137,21 +143,14 @@ def warmup() -> None:
     silence = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
     model = get_model()
     t0 = time.time()
-    list(
-        model.transcribe(
-            silence,
-            language="hi",
-            beam_size=1,
-            without_timestamps=True,
-            condition_on_previous_text=False,
-            vad_filter=False,
-        )[0]
-    )
+    # Match Pipecat call shape: transcribe(float, language=...)
+    list(model.transcribe(silence, language="hi")[0])
     _warmed = True
     print(f"warmup done in {(time.time() - t0) * 1000:.0f}ms")
 
 
-def _to_float32(audio: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def audio_bytes_to_float32(audio: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """WAV or raw PCM16LE → float32 [-1, 1], same normalization as Pipecat Whisper."""
     if len(audio) >= 12 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE":
         with wave.open(io.BytesIO(audio), "rb") as wf:
             ch, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
@@ -162,90 +161,35 @@ def _to_float32(audio: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
         if ch > 1:
             x = x.reshape(-1, ch).mean(axis=1)
         if rate != sample_rate and x.size:
-            n = int(x.shape[0] * sample_rate / rate)
+            n = max(1, int(x.shape[0] * sample_rate / rate))
             x = np.interp(
                 np.linspace(0, 1, n, endpoint=False),
                 np.linspace(0, 1, x.shape[0], endpoint=False),
                 x,
             ).astype(np.float32)
         return x
+    # Raw PCM (Pipecat SegmentedSTTService can also pass raw in some paths)
     return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
-    return buf.getvalue()
-
-
-def rms_energy(wave_f: np.ndarray) -> float:
-    if wave_f.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(np.square(wave_f), dtype=np.float64)))
-
-
-def has_speech_energy(wave_f: np.ndarray) -> bool:
-    return rms_energy(wave_f) >= 0.008
-
-
-def collapse_repeats(text: str, max_run: int = 2) -> str:
-    words = text.split()
-    if not words:
-        return text
-    out: list[str] = []
-    prev = None
-    run = 0
-    for w in words:
-        key = w.lower()
-        if key == prev:
-            run += 1
-            if run <= max_run:
-                out.append(w)
-        else:
-            prev = key
-            run = 1
-            out.append(w)
-    return " ".join(out)
-
-
-def is_repeat_loop(text: str, ratio: float = 0.5) -> bool:
-    words = [w.lower() for w in text.split() if w.strip()]
-    if len(words) < 8:
-        return False
-    _word, count = Counter(words).most_common(1)[0]
-    return (count / len(words)) >= ratio
-
-
 def strip_hallucination_tail(text: str) -> str:
-    """Keep real speech; cut known junk that Whisper appends after it.
-
-    Example:
-      "ईस्ट बाज़ारी अमलापरम। प्रतिक्रिया के लिए संस्कृति को दीनदयाल..."
-      → "ईस्ट बाज़ारी अमलापरम।"
-    """
+    """Keep real speech; cut known junk appended after it (telephony / noise)."""
     if not text:
         return text
-
     cut_at = len(text)
     low = text.lower()
     for marker in _HALLUCINATION_MARKERS:
-        m = marker.lower()
-        idx = low.find(m)
+        idx = low.find(marker.lower())
         if idx >= 0:
             cut_at = min(cut_at, idx)
-
     if cut_at < len(text):
-        kept = text[:cut_at].rstrip(" ।.,;:-–—")
+        kept = text[:cut_at].rstrip(" ।.,;:-–— \t")
         print(f"hallucination tail stripped → kept={kept!r}")
         return kept.strip()
     return text
 
 
-def _empty_result(language: str, infer_ms: float = 0.0) -> dict:
+def _empty(language: str, infer_ms: float = 0.0) -> dict:
     return {
         "text": "",
         "language": language,
@@ -260,88 +204,55 @@ def transcribe(
     audio: bytes,
     language: str = "hi",
     sample_rate: int = SAMPLE_RATE,
+    no_speech_prob: float | None = None,
 ) -> dict:
-    """Decode one utterance. Prefer matching HF quality over aggressive filters."""
+    """Decode one VAD segment the way Pipecat WhisperSTTService does.
+
+    Pipecat:
+        segments, _ = model.transcribe(audio_float, language=language)
+        keep segment if segment.no_speech_prob < no_speech_prob  (default 0.4)
+    """
     model = get_model()
-    wave_f = _to_float32(audio, sample_rate)
-    if wave_f.size == 0:
-        return _empty_result(language)
+    audio_float = audio_bytes_to_float32(audio, sample_rate)
+    if audio_float.size == 0:
+        return _empty(language)
 
-    duration_s = float(wave_f.size) / float(sample_rate)
-
-    if not has_speech_energy(wave_f):
-        print(f"skip decode: low energy rms={rms_energy(wave_f):.5f} dur={duration_s:.2f}s")
-        return _empty_result(language)
-
-    # Clip-level VAD can help strip leading/trailing silence (streaming pads).
-    # Disable with CLIP_VAD_FILTER=false if a clean file still differs from HF.
-    vad_filter = os.getenv("CLIP_VAD_FILTER", "true").lower() in ("1", "true", "yes")
-    beam = int(os.getenv("BEAM_SIZE", "5"))
+    nsp_threshold = (
+        no_speech_prob
+        if no_speech_prob is not None
+        else float(os.getenv("NO_SPEECH_PROB", str(DEFAULT_NO_SPEECH_PROB)))
+    )
 
     t0 = time.time()
-    # Keep decode close to a plain HF generate: greedy/beam, no weird penalties.
-    segments, _info = model.transcribe(
-        wave_f,
-        language=language or "hi",
-        task="transcribe",
-        beam_size=beam,
-        best_of=beam,
-        temperature=0.0,
-        word_timestamps=False,  # HF demo usually off; faster + less noise
-        without_timestamps=True,
-        condition_on_previous_text=False,
-        vad_filter=vad_filter,
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
-        no_speech_threshold=0.6,
-        repetition_penalty=1.0,  # HF default; higher values hurt place names
-        no_repeat_ngram_size=0,
-    )
+    # Minimal call — same as Pipecat (language only; faster-whisper defaults for the rest)
+    segments, _info = model.transcribe(audio_float, language=language or "hi")
     segs = list(segments)
     infer_ms = (time.time() - t0) * 1000
 
-    if not segs:
-        return _empty_result(language, infer_ms)
+    # Exact Pipecat filter: keep segment when no_speech_prob is *below* threshold
+    text_parts: list[str] = []
+    logprobs: list[float] = []
+    for segment in segs:
+        if segment.no_speech_prob < nsp_threshold:
+            part = (segment.text or "").strip()
+            if part:
+                text_parts.append(part)
+            if segment.avg_logprob is not None:
+                logprobs.append(float(segment.avg_logprob))
 
-    texts, lps = [], []
-    for s in segs:
-        # Only skip a segment if it is clearly non-speech *and* empty-ish
-        nsp = float(s.no_speech_prob or 0.0)
-        t = (s.text or "").strip()
-        if nsp >= 0.85 and not t:
-            continue
-        if nsp >= 0.9:
-            # Near-certain no-speech segment — skip even if model invented text
-            continue
-        if t:
-            texts.append(t)
-        if s.avg_logprob is not None:
-            lps.append(float(s.avg_logprob))
-
-    text = " ".join(texts).strip()
+    text = " ".join(text_parts).strip()
     text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
-    text = collapse_repeats(text, max_run=2)
-    # Critical: do not discard "East Amalapuram" when junk is appended after it
     text = strip_hallucination_tail(text)
 
     if not text:
-        return _empty_result(language, infer_ms)
+        return _empty(language, infer_ms)
 
-    if is_repeat_loop(text):
-        print(f"repeat-loop rejected: {text[:80]!r}")
-        return _empty_result(language, infer_ms)
-
-    # Pure junk with no real prefix left
-    if any(m.lower() in text.lower() for m in _HALLUCINATION_MARKERS):
-        print(f"still hallucination after strip: {text[:80]!r}")
-        return _empty_result(language, infer_ms)
-
-    avg = float(sum(lps) / len(lps)) if lps else 0.0
+    avg = float(sum(logprobs) / len(logprobs)) if logprobs else 0.0
     return {
         "text": text,
         "language": language,
         "avg_logprob": avg,
         "infer_ms": infer_ms,
-        "good_prob": bool(text) and avg > -1.0,
+        "good_prob": True,
         "no_speech": False,
     }

@@ -1,7 +1,17 @@
-"""Tara faster-whisper STT — speech-window only.
+"""Tara STT HTTP API — decode path matched to Pipecat Whisper.
 
-Client must only send PCM during user speech (Pipecat VAD start→stop).
-Server refuses silence / hallucination decode.
+Primary API (used by SegmentedSTT plugin)
+-----------------------------------------
+  POST /transcribe
+    multipart: audio_file (WAV or raw PCM16 from SegmentedSTTService)
+    header:    language: hi
+
+This mirrors Pipecat ``WhisperSTTService.run_stt``: one clip → one text.
+Pipeline VAD (SegmentedSTTService) owns utterance boundaries; this process
+only runs faster-whisper.
+
+Optional legacy WebSocket ``/stream`` remains for older clients (buffer +
+finalize). Prefer HTTP for the agent plugin.
 """
 
 from __future__ import annotations
@@ -10,7 +20,6 @@ import asyncio
 import json
 import os
 import random
-import re
 import string
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,19 +37,11 @@ if _env.exists():
         _k, _v = _line.split("=", 1)
         os.environ.setdefault(_k.strip(), _v.strip())
 
-from app.model import (
-    SAMPLE_RATE,
-    collapse_repeats,
-    load_model,
-    pcm16_to_wav,
-    transcribe,
-    warmup,
-)
+from app.model import SAMPLE_RATE, load_model, transcribe, warmup
 
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKERS", "2")))
-MAX_UTTERANCE_S = float(os.getenv("MAX_UTTERANCE_S", "12"))
-# With speech-only streaming, a real utterance is rarely under ~0.4s of speech.
-MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.35"))
+MAX_UTTERANCE_S = float(os.getenv("MAX_UTTERANCE_S", "30"))
+MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.2"))
 
 
 @asynccontextmanager
@@ -52,25 +53,29 @@ async def lifespan(app: FastAPI):
     _executor.shutdown(wait=False)
 
 
-app = FastAPI(title="Tara STT", version="1.3.0", lifespan=lifespan)
+app = FastAPI(
+    title="Tara STT",
+    version="1.4.0",
+    description="Pipecat-aligned faster-whisper API for Trelis/tara",
+)
 
 
-async def _run_asr(audio: bytes, language: str, sample_rate: int = SAMPLE_RATE) -> dict:
+async def _run_asr(audio: bytes, language: str) -> dict:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        _executor, lambda: transcribe(audio, language=language, sample_rate=sample_rate)
+        _executor, lambda: transcribe(audio, language=language)
     )
-
-
-def _clean_text(text: str) -> str:
-    text = text.replace("\ufffd", "").replace("�", "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return collapse_repeats(text, max_run=2)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mode": "continuous_buffer_finalize", "version": "1.3.1"}
+    return {
+        "status": "ok",
+        "version": "1.4.0",
+        "backend": "faster-whisper",
+        "decode": "pipecat_whisper_style",
+        "mixed_code": os.getenv("MIXED_CODE", "true"),
+    }
 
 
 @app.post("/transcribe")
@@ -78,37 +83,49 @@ async def http_transcribe(
     audio_file: UploadFile = File(...),
     language: str = Header("hi"),
 ):
+    """One VAD segment → one transcript (Pipecat Whisper equivalent)."""
     data = await audio_file.read()
     if not data:
-        return {"transcription": "", "error": "empty file"}
+        return {"transcription": "", "language": language or "hi", "infer_ms": 0.0}
+
     lang = (language or "hi").strip().lower().replace("_", "-").split("-", 1)[0]
+    t0 = time.time()
     result = await _run_asr(data, lang)
+    wall = (time.time() - t0) * 1000
+
+    text = (result.get("text") or "").strip()
+    print(
+        f"HTTP /transcribe lang={lang} text={text!r} "
+        f"infer={result.get('infer_ms', 0):.0f}ms wall={wall:.0f}ms "
+        f"bytes={len(data)}"
+    )
     return {
-        "transcription": _clean_text(result.get("text") or ""),
-        "language": result["language"],
-        "avg_logprob": result["avg_logprob"],
-        "infer_ms": result["infer_ms"],
+        "transcription": text,
+        "language": result.get("language", lang),
+        "avg_logprob": result.get("avg_logprob", 0.0),
+        "infer_ms": result.get("infer_ms", 0.0),
     }
+
+
+# --- Legacy WS (optional; agent plugin uses HTTP) ---
 
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
+    """Legacy continuous buffer + finalize protocol."""
     await ws.accept()
-
     sid = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     sample_rate = int(ws.headers.get("sample-rate", str(SAMPLE_RATE)))
     language = (ws.headers.get("language") or "hi").strip().lower()
     language = language.replace("_", "-").split("-", 1)[0]
 
-    bytes_per_s = sample_rate * 2
-    max_buf = int(MAX_UTTERANCE_S * bytes_per_s)
-    min_bytes = int(MIN_AUDIO_S * bytes_per_s)
-
+    max_buf = int(MAX_UTTERANCE_S * sample_rate * 2)
+    min_bytes = int(MIN_AUDIO_S * sample_rate * 2)
     buf = bytearray()
     lock = asyncio.Lock()
     decode_lock = asyncio.Lock()
 
-    print(f"[{sid}] open sr={sample_rate} lang={language} mode=continuous+finalize")
+    print(f"[{sid}] open sr={sample_rate} lang={language} mode=legacy_ws")
 
     async def finalize_utterance(reason: str = "finalize") -> None:
         nonlocal buf
@@ -121,48 +138,37 @@ async def stream(ws: WebSocket):
                 snap = bytes(buf)
                 buf.clear()
 
-            wav = pcm16_to_wav(snap, sample_rate)
-            t0 = time.time()
+            # Segmented path sends WAV; WS path sends raw PCM → wrap as WAV-equivalent
+            # by decoding as raw float inside transcribe (raw PCM branch).
             try:
-                r = await _run_asr(wav, language, sample_rate)
+                r = await _run_asr(snap, language)
             except Exception as e:
-                print(f"[{sid}] stt error: {e}")
-                try:
-                    await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
-                except Exception:
-                    pass
+                await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
                 return
 
-            text = _clean_text(r.get("text") or "")
-            wall = (time.time() - t0) * 1000
+            text = (r.get("text") or "").strip()
             print(
-                f"[{sid}] stt={text!r} lp={r['avg_logprob']:.3f} "
-                f"infer={r['infer_ms']:.0f}ms wall={wall:.0f}ms "
-                f"bytes={len(snap)} reason={reason} "
-                f"no_speech={r.get('no_speech')}"
+                f"[{sid}] stt={text!r} infer={r.get('infer_ms', 0):.0f}ms "
+                f"bytes={len(snap)} reason={reason}"
             )
-
-            if not text or r.get("no_speech"):
-                print(f"[{sid}] empty/no_speech dropped")
+            if not text:
                 return
-
-            payload = {
-                "type": "transcription",
-                "text": text,
-                "final": True,
-                "silence_duration": 0.0,
-                "avg_logprob": r["avg_logprob"],
-                "infer": int(r["infer_ms"]),
-                "stream_id": sid,
-                "reason": reason,
-            }
-            print(f"[{sid}] FINAL {text!r}")
-            await ws.send_text(json.dumps(payload))
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "transcription",
+                        "text": text,
+                        "final": True,
+                        "avg_logprob": r.get("avg_logprob", 0.0),
+                        "infer": int(r.get("infer_ms") or 0),
+                        "stream_id": sid,
+                    }
+                )
+            )
 
     try:
         while True:
             msg = await ws.receive()
-
             if msg.get("bytes") is not None:
                 chunk = msg["bytes"] or b""
                 if not chunk:
@@ -171,45 +177,30 @@ async def stream(ws: WebSocket):
                     buf.extend(chunk)
                     if len(buf) > max_buf:
                         buf[:] = buf[-max_buf:]
-                continue
-
-            if msg.get("text") is not None:
+            elif msg.get("text") is not None:
                 raw = (msg["text"] or "").strip()
-                if not raw:
-                    continue
                 if raw.lower() == "close":
                     await ws.close()
                     break
-
                 event = raw.lower()
                 try:
                     obj = json.loads(raw)
                     if isinstance(obj, dict):
-                        event = str(obj.get("event") or obj.get("type") or "").lower()
+                        event = str(obj.get("event") or "").lower()
                 except json.JSONDecodeError:
                     pass
-
                 if event in ("finalize", "flush", "end"):
-                    await finalize_utterance(reason=event)
+                    await finalize_utterance(event)
                 elif event in ("clear", "reset"):
                     async with lock:
-                        n = len(buf)
                         buf.clear()
-                    if n:
-                        print(f"[{sid}] cleared {n} bytes")
-                else:
-                    print(f"[{sid}] ignore text: {raw[:80]!r}")
-                continue
-
-            if msg.get("type") == "websocket.disconnect":
+            elif msg.get("type") == "websocket.disconnect":
                 break
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"[{sid}] error: {e}")
         try:
             await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
-            await ws.close(code=1011)
         except Exception:
             pass
     finally:
