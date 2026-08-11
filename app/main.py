@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import string
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -38,8 +39,13 @@ if _env.exists():
 
 from app.model import SAMPLE_RATE, load_model, pcm16_to_wav, transcribe
 
-# --- model load on startup ---
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKERS", "2")))
+
+# Streaming tuning (can override via env)
+MAX_UTTERANCE_S = float(os.getenv("MAX_UTTERANCE_S", "12"))  # hard cap buffer
+MIN_SPEECH_S = float(os.getenv("MIN_SPEECH_S", "0.35"))  # ignore blips
+MIN_FINAL_CHARS = int(os.getenv("MIN_FINAL_CHARS", "2"))
+LOGPROB_MIN = float(os.getenv("LOGPROB_THRESHOLD", "-0.45"))
 
 
 @asynccontextmanager
@@ -49,9 +55,8 @@ async def lifespan(app: FastAPI):
     _executor.shutdown(wait=False)
 
 
-app = FastAPI(title="Tara STT", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Tara STT", version="1.0.1", lifespan=lifespan)
 
-# --- VAD (shared) ---
 _vad = load_silero_vad()
 _vad.eval()
 _vad_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -83,6 +88,38 @@ async def _run_asr(audio: bytes, language: str, sample_rate: int = SAMPLE_RATE) 
     )
 
 
+def _clean_text(text: str) -> str:
+    # drop replacement chars and collapse whitespace
+    text = text.replace("\ufffd", "").replace("�", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _is_junk(text: str) -> bool:
+    """Filter Whisper hallucinations / empty noise."""
+    t = _clean_text(text)
+    if len(t) < MIN_FINAL_CHARS:
+        return True
+    # pure punctuation
+    if re.fullmatch(r"[\W_]+", t, flags=re.UNICODE):
+        return True
+    # repeated single word 4+ times (हाँ हाँ हाँ हाँ)
+    words = t.split()
+    if len(words) >= 4 and len(set(w.lower() for w in words)) == 1:
+        return True
+    low = t.lower()
+    for s in (
+        "subtitle",
+        "sous-titrage",
+        "thanks for watching",
+        "www.",
+        "subscribe",
+    ):
+        if s in low:
+            return True
+    return False
+
+
 # ---------- HTTP ----------
 
 
@@ -96,14 +133,14 @@ async def http_transcribe(
     audio_file: UploadFile = File(...),
     language: str = Header("hi"),
 ):
-    """Upload a wav/mp3/audio file → JSON transcript."""
     data = await audio_file.read()
     if not data:
         return {"text": "", "error": "empty file"}
     lang = (language or "hi").strip().lower().replace("_", "-").split("-", 1)[0]
     result = await _run_asr(data, lang)
+    text = _clean_text(result["text"])
     return {
-        "transcription": result["text"],
+        "transcription": text,
         "language": result["language"],
         "avg_logprob": result["avg_logprob"],
         "infer_ms": result["infer_ms"],
@@ -111,7 +148,6 @@ async def http_transcribe(
 
 
 # ---------- WebSocket streaming ----------
-# Compatible with techladder tara_stt plugin (headers optional; no auth).
 
 
 @app.websocket("/stream")
@@ -120,13 +156,17 @@ async def stream(ws: WebSocket):
 
     sid = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     sample_rate = int(ws.headers.get("sample-rate", str(SAMPLE_RATE)))
-    vad_threshold = float(ws.headers.get("vad-threshold", "0.3"))
-    min_silence = float(ws.headers.get("min-silence-duration", "0.3"))
+    vad_threshold = float(ws.headers.get("vad-threshold", "0.45"))
+    min_silence = float(ws.headers.get("min-silence-duration", "0.4"))
     language = (ws.headers.get("language") or "hi").strip().lower()
     language = language.replace("_", "-").split("-", 1)[0]
-    logprob_min = float(os.getenv("LOGPROB_THRESHOLD", "-0.5"))
+
+    bytes_per_s = sample_rate * 2  # PCM16 mono
+    max_buf = int(MAX_UTTERANCE_S * bytes_per_s)
+    min_speech_bytes = int(MIN_SPEECH_S * bytes_per_s)
 
     buf = bytearray()
+    speech_bytes = 0  # speech-only counter (for min length)
     last_silence: float | None = None
     have_speech = False
     last_text = ""
@@ -134,37 +174,66 @@ async def stream(ws: WebSocket):
     last_good = False
     last_infer = 0
     stt_task: asyncio.Task | None = None
+    stt_lock = asyncio.Lock()
 
-    print(f"[{sid}] open sr={sample_rate} lang={language}")
+    print(
+        f"[{sid}] open sr={sample_rate} lang={language} "
+        f"vad={vad_threshold} min_sil={min_silence}"
+    )
+
+    def _trim_buf() -> None:
+        nonlocal buf
+        if len(buf) > max_buf:
+            # keep last MAX_UTTERANCE_S only
+            buf = bytearray(buf[-max_buf:])
 
     async def do_stt():
         nonlocal last_text, last_lp, last_good, last_infer
-        # need ~200ms
-        if len(buf) < int(sample_rate * 0.2) * 2:
-            return
-        wav = pcm16_to_wav(bytes(buf), sample_rate)
-        try:
-            r = await _run_asr(wav, language, sample_rate)
-            last_text = r["text"]
-            last_lp = r["avg_logprob"]
-            last_good = r["good_prob"]
-            last_infer = int(r["infer_ms"])
-            print(f"[{sid}] stt={last_text!r} lp={last_lp:.3f} good={last_good}")
-        except Exception as e:
-            print(f"[{sid}] stt error: {e}")
+        async with stt_lock:
+            if len(buf) < min_speech_bytes:
+                return
+            snap = bytes(buf)
+            wav = pcm16_to_wav(snap, sample_rate)
+            try:
+                r = await _run_asr(wav, language, sample_rate)
+                text = _clean_text(r["text"])
+                if _is_junk(text):
+                    print(f"[{sid}] stt junk dropped={text!r} lp={r['avg_logprob']:.3f}")
+                    last_text = ""
+                    last_lp = None
+                    last_good = False
+                    return
+                last_text = text
+                last_lp = r["avg_logprob"]
+                last_good = bool(r["good_prob"]) and last_lp is not None and last_lp > LOGPROB_MIN
+                last_infer = int(r["infer_ms"])
+                print(
+                    f"[{sid}] stt={last_text!r} lp={last_lp:.3f} "
+                    f"good={last_good} infer={last_infer}ms bytes={len(snap)}"
+                )
+            except Exception as e:
+                print(f"[{sid}] stt error: {e}")
 
     async def maybe_final():
-        nonlocal last_text, buf, last_silence, have_speech, last_lp, last_good
+        nonlocal last_text, buf, last_silence, have_speech, last_lp, last_good, speech_bytes
         if not last_text.strip() or last_lp is None or last_silence is None:
             return
         silence = time.time() - last_silence
         if silence < min_silence:
             return
-        if not last_good or last_lp <= logprob_min:
+        if speech_bytes < min_speech_bytes:
+            return
+        if not last_good or last_lp <= LOGPROB_MIN:
+            return
+        if _is_junk(last_text):
             return
 
         if stt_task and not stt_task.done():
             await stt_task
+
+        # re-check after awaiting in-flight STT
+        if not last_text.strip() or last_lp is None or _is_junk(last_text):
+            return
 
         payload = {
             "type": "transcription",
@@ -180,6 +249,7 @@ async def stream(ws: WebSocket):
 
         last_text = ""
         buf.clear()
+        speech_bytes = 0
         last_silence = None
         have_speech = False
         last_lp = None
@@ -191,16 +261,25 @@ async def stream(ws: WebSocket):
             if msg.get("bytes"):
                 chunk = msg["bytes"]
                 buf.extend(chunk)
-                speaking = _vad_prob(chunk, sample_rate) > vad_threshold
+                _trim_buf()
+
+                prob = _vad_prob(chunk, sample_rate)
+                speaking = prob > vad_threshold
 
                 if speaking:
+                    speech_bytes += len(chunk)
+                    if last_silence is not None:
+                        print(f"[{sid}] speech (vad={prob:.2f})")
                     last_silence = None
                     have_speech = True
                 else:
                     if last_silence is None and have_speech:
                         last_silence = time.time()
-                        if not stt_task or stt_task.done():
-                            stt_task = asyncio.create_task(do_stt())
+                        print(f"[{sid}] silence start (vad={prob:.2f})")
+                        # kick STT once at silence onset
+                        if speech_bytes >= min_speech_bytes:
+                            if not stt_task or stt_task.done():
+                                stt_task = asyncio.create_task(do_stt())
                     if last_silence is not None:
                         await maybe_final()
 
