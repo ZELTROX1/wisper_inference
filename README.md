@@ -39,33 +39,22 @@ curl -X POST http://localhost:8080/transcribe \
 }
 ```
 
-### WebSocket stream
+### WebSocket stream (client VAD — Pipecat owns endpoints)
 ```
 WS /stream
 ```
 
-Headers (all optional):
-- `sample-rate` (default 16000)
-- `language` (default hi)
-- `vad-threshold` (default 0.3)
-- `min-silence-duration` (default 0.3)
+Headers: `sample-rate` (16000), `language` (hi)
 
-Client sends raw **PCM16LE mono** binary frames.  
-Server replies with finals:
-
-```json
-{
-  "type": "transcription",
-  "text": "...",
-  "final": true,
-  "silence_duration": 0.35,
-  "avg_logprob": -0.15,
-  "infer": 140,
-  "stream_id": "AB12"
-}
+```
+Client → binary PCM16LE mono
+Client → {"event":"finalize"}   # Pipecat VADUserStoppedSpeaking
+Client → {"event":"clear"}      # bot started speaking (drop buffer)
+Server → {"type":"transcription","text":"...","final":true,...}
+Client → "close"
 ```
 
-Send text `close` to hang up.
+No server-side Silero VAD — same pattern as Qwen3-ASR.
 
 ## Agents (techladder)
 
