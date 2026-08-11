@@ -70,7 +70,7 @@ def _clean_text(text: str) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mode": "speech_window", "version": "1.3.0"}
+    return {"status": "ok", "mode": "continuous_buffer_finalize", "version": "1.3.1"}
 
 
 @app.post("/transcribe")
@@ -108,7 +108,7 @@ async def stream(ws: WebSocket):
     lock = asyncio.Lock()
     decode_lock = asyncio.Lock()
 
-    print(f"[{sid}] open sr={sample_rate} lang={language} mode=speech_window")
+    print(f"[{sid}] open sr={sample_rate} lang={language} mode=continuous+finalize")
 
     async def finalize_utterance(reason: str = "finalize") -> None:
         nonlocal buf

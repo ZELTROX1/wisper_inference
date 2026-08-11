@@ -1,8 +1,18 @@
-"""Faster-whisper model + Tara mixed-code prompt.
+"""Faster-whisper / CTranslate2 backend for Tara.
 
-Hallucination control is architectural where possible:
-  - client only sends speech windows
-  - here we refuse to invent text on silence / no-speech / impossible density
+Why HF demo can look better than this path
+------------------------------------------
+HuggingFace Spaces use Transformers ``generate`` with a clean clip and
+``forced_decoder_ids`` (often mixed-code). This service:
+
+  1. Runs CTranslate2 (same weights if conversion was correct).
+  2. Streams telephony buffers that may include silence / noise around speech.
+  3. Used to **drop the whole transcript** when a known junk phrase appeared
+     anywhere — so real speech like "East Godavari Amalapuram" was deleted
+     when the model appended "दीनदयाल…कौशल योजना" after it.
+
+We now **strip** hallucination tails and keep the real prefix, and use
+decode settings closer to a simple HF generate call.
 """
 
 from __future__ import annotations
@@ -25,16 +35,19 @@ MIXEDCODE = "<|mixedcode|>"
 _model: WhisperModel | None = None
 _warmed = False
 
-# Phrases Whisper invents on noise in Indic telephony (seen in production logs).
+# Junk Whisper/Tara often appends after real speech on noisy telephony clips.
+# Match case-insensitively; we cut from the first hit and keep the prefix.
 _HALLUCINATION_MARKERS = (
+    "प्रतिक्रिया के लिए संस्कृति",
     "दीनदयाल",
     "दीन दयाल",
     "ग्रामीण कौशल",
-    "प्रतिक्रिया के लिए संस्कृति",
+    "कौशल योजना",
     "विशिष्टता को समर्थन",
     "subscribe",
     "thanks for watching",
     "sous-titrage",
+    "www.",
 )
 
 
@@ -67,7 +80,7 @@ def enable_mixedcode(model: WhisperModel) -> None:
         mc = tokenizer.tokenizer.token_to_id(MIXEDCODE)
         if mc is None:
             raise RuntimeError(
-                f"{MIXEDCODE} missing — convert model with --copy_files tokenizer.json"
+                f"{MIXEDCODE} missing — convert with --copy_files tokenizer.json"
             )
         prompt.append(mc)
 
@@ -104,6 +117,8 @@ def load_model() -> WhisperModel:
     if mixed:
         enable_mixedcode(model)
         print("mixed-code ON")
+    else:
+        print("mixed-code OFF (pure language token only — closer to plain HF hi mode)")
     _model = model
     print("model ready")
     return model
@@ -174,10 +189,7 @@ def rms_energy(wave_f: np.ndarray) -> float:
 
 
 def has_speech_energy(wave_f: np.ndarray) -> bool:
-    """True if waveform is loud enough to be speech (not silence/noise floor)."""
-    # Absolute RMS gate — silence / line noise fails; real speech passes.
-    # Tuned for 16-bit PCM normalized to [-1, 1].
-    return rms_energy(wave_f) >= 0.01
+    return rms_energy(wave_f) >= 0.008
 
 
 def collapse_repeats(text: str, max_run: int = 2) -> str:
@@ -200,28 +212,37 @@ def collapse_repeats(text: str, max_run: int = 2) -> str:
     return " ".join(out)
 
 
-def is_repeat_loop(text: str, ratio: float = 0.45) -> bool:
+def is_repeat_loop(text: str, ratio: float = 0.5) -> bool:
     words = [w.lower() for w in text.split() if w.strip()]
-    if len(words) < 6:
+    if len(words) < 8:
         return False
     _word, count = Counter(words).most_common(1)[0]
     return (count / len(words)) >= ratio
 
 
-def is_impossible_density(text: str, duration_s: float) -> bool:
-    """Reject when model dumps more words than a human could have spoken."""
-    if duration_s <= 0:
-        return True
-    words = text.split()
-    if not words:
-        return False
-    # ~4 words/sec is already fast speech; above that is invented text on noise.
-    return (len(words) / duration_s) > 4.5
+def strip_hallucination_tail(text: str) -> str:
+    """Keep real speech; cut known junk that Whisper appends after it.
 
+    Example:
+      "ईस्ट बाज़ारी अमलापरम। प्रतिक्रिया के लिए संस्कृति को दीनदयाल..."
+      → "ईस्ट बाज़ारी अमलापरम।"
+    """
+    if not text:
+        return text
 
-def looks_like_known_hallucination(text: str) -> bool:
+    cut_at = len(text)
     low = text.lower()
-    return any(m.lower() in low for m in _HALLUCINATION_MARKERS)
+    for marker in _HALLUCINATION_MARKERS:
+        m = marker.lower()
+        idx = low.find(m)
+        if idx >= 0:
+            cut_at = min(cut_at, idx)
+
+    if cut_at < len(text):
+        kept = text[:cut_at].rstrip(" ।.,;:-–—")
+        print(f"hallucination tail stripped → kept={kept!r}")
+        return kept.strip()
+    return text
 
 
 def _empty_result(language: str, infer_ms: float = 0.0) -> dict:
@@ -240,7 +261,7 @@ def transcribe(
     language: str = "hi",
     sample_rate: int = SAMPLE_RATE,
 ) -> dict:
-    """Run ASR. Returns empty text when input is silence or model is inventing."""
+    """Decode one utterance. Prefer matching HF quality over aggressive filters."""
     model = get_model()
     wave_f = _to_float32(audio, sample_rate)
     if wave_f.size == 0:
@@ -248,30 +269,33 @@ def transcribe(
 
     duration_s = float(wave_f.size) / float(sample_rate)
 
-    # Do not call the decoder on silence — Whisper invents long Hindi phrases.
     if not has_speech_energy(wave_f):
         print(f"skip decode: low energy rms={rms_energy(wave_f):.5f} dur={duration_s:.2f}s")
         return _empty_result(language)
 
+    # Clip-level VAD can help strip leading/trailing silence (streaming pads).
+    # Disable with CLIP_VAD_FILTER=false if a clean file still differs from HF.
     vad_filter = os.getenv("CLIP_VAD_FILTER", "true").lower() in ("1", "true", "yes")
     beam = int(os.getenv("BEAM_SIZE", "5"))
 
     t0 = time.time()
+    # Keep decode close to a plain HF generate: greedy/beam, no weird penalties.
     segments, _info = model.transcribe(
         wave_f,
         language=language or "hi",
         task="transcribe",
         beam_size=beam,
+        best_of=beam,
         temperature=0.0,
-        word_timestamps=True,
+        word_timestamps=False,  # HF demo usually off; faster + less noise
         without_timestamps=True,
         condition_on_previous_text=False,
         vad_filter=vad_filter,
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
-        repetition_penalty=1.15,
-        no_repeat_ngram_size=3,
+        repetition_penalty=1.0,  # HF default; higher values hurt place names
+        no_repeat_ngram_size=0,
     )
     segs = list(segments)
     infer_ms = (time.time() - t0) * 1000
@@ -279,50 +303,37 @@ def transcribe(
     if not segs:
         return _empty_result(language, infer_ms)
 
-    # If every segment looks like no-speech, refuse the text.
-    if all(float(s.no_speech_prob or 0.0) >= 0.6 for s in segs):
-        print("skip decode: no_speech_prob high on all segments")
-        return _empty_result(language, infer_ms)
-
     texts, lps = [], []
-    good = False
-    max_no_speech = 0.0
-    max_comp = 0.0
     for s in segs:
-        max_no_speech = max(max_no_speech, float(s.no_speech_prob or 0.0))
-        max_comp = max(max_comp, float(s.compression_ratio or 0.0))
-        # Drop individual segments that are themselves no-speech inventions
-        if float(s.no_speech_prob or 0.0) >= 0.6:
-            continue
+        # Only skip a segment if it is clearly non-speech *and* empty-ish
+        nsp = float(s.no_speech_prob or 0.0)
         t = (s.text or "").strip()
+        if nsp >= 0.85 and not t:
+            continue
+        if nsp >= 0.9:
+            # Near-certain no-speech segment — skip even if model invented text
+            continue
         if t:
             texts.append(t)
         if s.avg_logprob is not None:
             lps.append(float(s.avg_logprob))
-        if s.words:
-            good = good or any(
-                w.probability is not None and float(w.probability) > 0.8 for w in s.words
-            )
 
     text = " ".join(texts).strip()
     text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
     text = collapse_repeats(text, max_run=2)
+    # Critical: do not discard "East Amalapuram" when junk is appended after it
+    text = strip_hallucination_tail(text)
 
     if not text:
         return _empty_result(language, infer_ms)
 
-    if is_repeat_loop(text) or looks_like_known_hallucination(text):
-        print(f"hallucination rejected: {text[:100]!r}")
+    if is_repeat_loop(text):
+        print(f"repeat-loop rejected: {text[:80]!r}")
         return _empty_result(language, infer_ms)
 
-    if is_impossible_density(text, duration_s):
-        print(
-            f"density rejected: {len(text.split())} words in {duration_s:.2f}s → {text[:80]!r}"
-        )
-        return _empty_result(language, infer_ms)
-
-    if max_comp >= 2.4:
-        print(f"compression_ratio rejected: {max_comp:.2f}")
+    # Pure junk with no real prefix left
+    if any(m.lower() in text.lower() for m in _HALLUCINATION_MARKERS):
+        print(f"still hallucination after strip: {text[:80]!r}")
         return _empty_result(language, infer_ms)
 
     avg = float(sum(lps) / len(lps)) if lps else 0.0
@@ -331,6 +342,6 @@ def transcribe(
         "language": language,
         "avg_logprob": avg,
         "infer_ms": infer_ms,
-        "good_prob": good or (avg > -0.5 and bool(text)),
+        "good_prob": bool(text) and avg > -1.0,
         "no_speech": False,
     }
