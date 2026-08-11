@@ -1,24 +1,16 @@
-"""Tara faster-whisper inference — aligned with Pipecat WhisperSTTService.
+"""Tara faster-whisper inference for SegmentedSTT (Pipecat Whisper pattern).
 
-Pipecat source of truth
------------------------
-``pipecat.services.whisper.stt.WhisperSTTService.run_stt``:
+Flow (same as Pipecat WhisperSTTService + SegmentedSTTService)
+--------------------------------------------------------------
+  Agent buffers one VAD utterance (with ~1s pre-roll) → POST /transcribe
+  Server: float32 = pcm / 32768 → model.transcribe(...) → filter segments
 
-    audio_float = pcm_i16.astype(float32) / 32768.0
-    segments, _ = model.transcribe(audio_float, language=language)
-    for segment in segments:
-        if segment.no_speech_prob < no_speech_prob:   # default 0.4
-            text += segment.text
+Pipecat calls ``transcribe(audio, language=...)`` with defaults only. That is
+fine on clean desktop mics; telephony needs a few explicit safer defaults
+(condition_on_previous_text=False, temperature=0, clip VAD) or quality
+collapses into hallucinations like "coworking / कौशल योजना / ?".
 
-That is intentionally minimal: no beam/penalty maze. Pipeline VAD
-(SegmentedSTTService) already cuts the utterance; the model only decodes
-one clean clip.
-
-Tara-only extras
-----------------
-  * load CT2 path from MODEL_PATH
-  * inject ``<|mixedcode|>`` for Hinglish (optional, MIXED_CODE=true)
-  * strip known junk tails (दीनदयाल / कौशल योजना) so real place names stay
+Tara-only: optional ``<|mixedcode|>`` prompt + strip known junk tails.
 """
 
 from __future__ import annotations
@@ -37,13 +29,12 @@ from faster_whisper.tokenizer import Tokenizer
 SAMPLE_RATE = 16_000
 MIXEDCODE = "<|mixedcode|>"
 
-# Pipecat WhisperSTTSettings default
-DEFAULT_NO_SPEECH_PROB = 0.4
+# Pipecat WhisperSTTSettings default: keep segment if no_speech_prob < this
+DEFAULT_NO_SPEECH_PROB = float(os.getenv("NO_SPEECH_PROB", "0.4"))
 
 _model: WhisperModel | None = None
 _warmed = False
 
-# Junk often appended after real speech on noisy telephony (not on clean HF demos).
 _HALLUCINATION_MARKERS = (
     "प्रतिक्रिया के लिए संस्कृति",
     "दीनदयाल",
@@ -55,11 +46,13 @@ _HALLUCINATION_MARKERS = (
     "thanks for watching",
     "sous-titrage",
     "www.",
+    "coworking",
+    "працювати",  # random non-HI/EN garbage seen in logs
 )
 
 
 def enable_mixedcode(model: WhisperModel) -> None:
-    """Tara mixed-code: sot → language → <|mixedcode|> → task → …"""
+    """Tara: sot → lang → <|mixedcode|> → task → notimestamps."""
 
     def get_prompt(
         tokenizer: Tokenizer,
@@ -119,14 +112,13 @@ def load_model() -> WhisperModel:
     compute_type = os.getenv("COMPUTE_TYPE", "float16")
     mixed = os.getenv("MIXED_CODE", "true").lower() in ("1", "true", "yes")
 
-    print(f"Loading {path} device={device} compute_type={compute_type}")
-    # Same constructor style as Pipecat WhisperSTTService._load
+    print(f"Loading {path} device={device} compute_type={compute_type}", flush=True)
     model = WhisperModel(path, device=device, compute_type=compute_type)
     if mixed:
         enable_mixedcode(model)
-        print("mixed-code ON")
+        print("mixed-code ON", flush=True)
     _model = model
-    print("model ready")
+    print("model ready", flush=True)
     return model
 
 
@@ -143,14 +135,22 @@ def warmup() -> None:
     silence = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
     model = get_model()
     t0 = time.time()
-    # Match Pipecat call shape: transcribe(float, language=...)
-    list(model.transcribe(silence, language="hi")[0])
+    list(
+        model.transcribe(
+            silence,
+            language="hi",
+            beam_size=1,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            vad_filter=False,
+        )[0]
+    )
     _warmed = True
-    print(f"warmup done in {(time.time() - t0) * 1000:.0f}ms")
+    print(f"warmup done in {(time.time() - t0) * 1000:.0f}ms", flush=True)
 
 
 def audio_bytes_to_float32(audio: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """WAV or raw PCM16LE → float32 [-1, 1], same normalization as Pipecat Whisper."""
+    """WAV or raw PCM16LE → float32 [-1, 1] (Pipecat: i16 / 32768)."""
     if len(audio) >= 12 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE":
         with wave.open(io.BytesIO(audio), "rb") as wf:
             ch, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
@@ -168,12 +168,10 @@ def audio_bytes_to_float32(audio: bytes, sample_rate: int = SAMPLE_RATE) -> np.n
                 x,
             ).astype(np.float32)
         return x
-    # Raw PCM (Pipecat SegmentedSTTService can also pass raw in some paths)
     return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def strip_hallucination_tail(text: str) -> str:
-    """Keep real speech; cut known junk appended after it (telephony / noise)."""
     if not text:
         return text
     cut_at = len(text)
@@ -183,10 +181,22 @@ def strip_hallucination_tail(text: str) -> str:
         if idx >= 0:
             cut_at = min(cut_at, idx)
     if cut_at < len(text):
-        kept = text[:cut_at].rstrip(" ।.,;:-–— \t")
-        print(f"hallucination tail stripped → kept={kept!r}")
+        kept = text[:cut_at].rstrip(" ।.,;:-–— \t?")
+        print(f"hallucination tail stripped → kept={kept!r}", flush=True)
         return kept.strip()
     return text
+
+
+def is_useless_text(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    # punctuation-only / single char garbage
+    if re.fullmatch(r"[\W_]+", t, flags=re.UNICODE):
+        return True
+    if len(t) == 1:
+        return True
+    return False
 
 
 def _empty(language: str, infer_ms: float = 0.0) -> dict:
@@ -206,30 +216,48 @@ def transcribe(
     sample_rate: int = SAMPLE_RATE,
     no_speech_prob: float | None = None,
 ) -> dict:
-    """Decode one VAD segment the way Pipecat WhisperSTTService does.
-
-    Pipecat:
-        segments, _ = model.transcribe(audio_float, language=language)
-        keep segment if segment.no_speech_prob < no_speech_prob  (default 0.4)
-    """
+    """One SegmentedSTT utterance → text (Pipecat Whisper + telephony-safe opts)."""
     model = get_model()
     audio_float = audio_bytes_to_float32(audio, sample_rate)
     if audio_float.size == 0:
         return _empty(language)
 
+    duration_s = float(audio_float.size) / float(sample_rate)
     nsp_threshold = (
-        no_speech_prob
-        if no_speech_prob is not None
-        else float(os.getenv("NO_SPEECH_PROB", str(DEFAULT_NO_SPEECH_PROB)))
+        no_speech_prob if no_speech_prob is not None else DEFAULT_NO_SPEECH_PROB
     )
 
+    # Clip VAD: SegmentedSTT already cut speech, but pre-roll can be ~1s of
+    # silence/noise; stripping it reduces "दीनदयाल / coworking" junk.
+    use_clip_vad = os.getenv("CLIP_VAD_FILTER", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    beam = int(os.getenv("BEAM_SIZE", "5"))
+
     t0 = time.time()
-    # Minimal call — same as Pipecat (language only; faster-whisper defaults for the rest)
-    segments, _info = model.transcribe(audio_float, language=language or "hi")
+    # Structure matches Pipecat (language + float audio). Extra kwargs are the
+    # minimal set that keeps telephony from falling apart vs bare defaults.
+    segments, _info = model.transcribe(
+        audio_float,
+        language=language or "hi",
+        task="transcribe",
+        beam_size=beam,
+        best_of=beam,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        without_timestamps=True,
+        vad_filter=use_clip_vad,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        word_timestamps=False,
+    )
     segs = list(segments)
     infer_ms = (time.time() - t0) * 1000
 
-    # Exact Pipecat filter: keep segment when no_speech_prob is *below* threshold
+    # Pipecat: keep segment if no_speech_prob < threshold
     text_parts: list[str] = []
     logprobs: list[float] = []
     for segment in segs:
@@ -244,7 +272,25 @@ def transcribe(
     text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
     text = strip_hallucination_tail(text)
 
-    if not text:
+    if is_useless_text(text):
+        print(
+            f"empty/useless after filter dur={duration_s:.2f}s segs={len(segs)}",
+            flush=True,
+        )
+        return _empty(language, infer_ms)
+
+    # Pure junk left after strip
+    if any(m.lower() in text.lower() for m in _HALLUCINATION_MARKERS):
+        print(f"junk still present, drop: {text[:80]!r}", flush=True)
+        return _empty(language, infer_ms)
+
+    # Impossible density = invented monologue on ~1s of audio
+    n_words = len(text.split())
+    if duration_s > 0 and n_words / duration_s > 5.0 and n_words >= 12:
+        print(
+            f"density drop: {n_words} words / {duration_s:.2f}s → {text[:60]!r}",
+            flush=True,
+        )
         return _empty(language, infer_ms)
 
     avg = float(sum(logprobs) / len(logprobs)) if logprobs else 0.0

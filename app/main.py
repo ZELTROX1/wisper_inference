@@ -1,17 +1,7 @@
-"""Tara STT HTTP API — decode path matched to Pipecat Whisper.
+"""Tara STT API — Pipecat SegmentedSTT / Whisper-style one-shot decode.
 
-Primary API (used by SegmentedSTT plugin)
------------------------------------------
-  POST /transcribe
-    multipart: audio_file (WAV or raw PCM16 from SegmentedSTTService)
-    header:    language: hi
-
-This mirrors Pipecat ``WhisperSTTService.run_stt``: one clip → one text.
-Pipeline VAD (SegmentedSTTService) owns utterance boundaries; this process
-only runs faster-whisper.
-
-Optional legacy WebSocket ``/stream`` remains for older clients (buffer +
-finalize). Prefer HTTP for the agent plugin.
+Primary: POST /transcribe  (agent TaraSTTService SegmentedSTT → HTTP)
+Legacy:  WS /stream
 """
 
 from __future__ import annotations
@@ -21,12 +11,19 @@ import json
 import os
 import random
 import string
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Header, UploadFile, WebSocket, WebSocketDisconnect
+
+# Unbuffered logs so "Loading..." appears before startup complete
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
 
 _env = Path(__file__).resolve().parents[1] / ".env"
 if _env.exists():
@@ -46,17 +43,21 @@ MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.2"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Block until model is on GPU so first request is not a cold load
+    print("startup: loading model…", flush=True)
     load_model()
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(_executor, warmup)
+    print("startup: ready to serve", flush=True)
     yield
     _executor.shutdown(wait=False)
 
 
 app = FastAPI(
     title="Tara STT",
-    version="1.4.0",
-    description="Pipecat-aligned faster-whisper API for Trelis/tara",
+    version="1.4.1",
+    description="Pipecat Whisper-aligned faster-whisper for Trelis/tara",
+    lifespan=lifespan,
 )
 
 
@@ -71,10 +72,11 @@ async def _run_asr(audio: bytes, language: str) -> dict:
 async def health():
     return {
         "status": "ok",
-        "version": "1.4.0",
+        "version": "1.4.1",
         "backend": "faster-whisper",
-        "decode": "pipecat_whisper_style",
+        "decode": "pipecat_whisper_plus_telephony",
         "mixed_code": os.getenv("MIXED_CODE", "true"),
+        "model_path": os.getenv("MODEL_PATH", "./models/tara-ct2"),
     }
 
 
@@ -83,10 +85,15 @@ async def http_transcribe(
     audio_file: UploadFile = File(...),
     language: str = Header("hi"),
 ):
-    """One VAD segment → one transcript (Pipecat Whisper equivalent)."""
+    """One VAD segment (WAV/PCM) → one transcript."""
     data = await audio_file.read()
     if not data:
-        return {"transcription": "", "language": language or "hi", "infer_ms": 0.0}
+        return {
+            "transcription": "",
+            "language": language or "hi",
+            "avg_logprob": 0.0,
+            "infer_ms": 0.0,
+        }
 
     lang = (language or "hi").strip().lower().replace("_", "-").split("-", 1)[0]
     t0 = time.time()
@@ -97,7 +104,8 @@ async def http_transcribe(
     print(
         f"HTTP /transcribe lang={lang} text={text!r} "
         f"infer={result.get('infer_ms', 0):.0f}ms wall={wall:.0f}ms "
-        f"bytes={len(data)}"
+        f"bytes={len(data)}",
+        flush=True,
     )
     return {
         "transcription": text,
@@ -107,12 +115,9 @@ async def http_transcribe(
     }
 
 
-# --- Legacy WS (optional; agent plugin uses HTTP) ---
-
-
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
-    """Legacy continuous buffer + finalize protocol."""
+    """Legacy WS buffer+finalize (prefer HTTP for SegmentedSTT agents)."""
     await ws.accept()
     sid = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     sample_rate = int(ws.headers.get("sample-rate", str(SAMPLE_RATE)))
@@ -124,33 +129,23 @@ async def stream(ws: WebSocket):
     buf = bytearray()
     lock = asyncio.Lock()
     decode_lock = asyncio.Lock()
-
-    print(f"[{sid}] open sr={sample_rate} lang={language} mode=legacy_ws")
+    print(f"[{sid}] open sr={sample_rate} lang={language} mode=legacy_ws", flush=True)
 
     async def finalize_utterance(reason: str = "finalize") -> None:
         nonlocal buf
         async with decode_lock:
             async with lock:
                 if len(buf) < min_bytes:
-                    print(f"[{sid}] {reason} skip short buf={len(buf)}")
                     buf.clear()
                     return
                 snap = bytes(buf)
                 buf.clear()
-
-            # Segmented path sends WAV; WS path sends raw PCM → wrap as WAV-equivalent
-            # by decoding as raw float inside transcribe (raw PCM branch).
             try:
                 r = await _run_asr(snap, language)
             except Exception as e:
                 await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
                 return
-
             text = (r.get("text") or "").strip()
-            print(
-                f"[{sid}] stt={text!r} infer={r.get('infer_ms', 0):.0f}ms "
-                f"bytes={len(snap)} reason={reason}"
-            )
             if not text:
                 return
             await ws.send_text(
@@ -198,13 +193,8 @@ async def stream(ws: WebSocket):
                 break
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        try:
-            await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
-        except Exception:
-            pass
     finally:
-        print(f"[{sid}] closed")
+        print(f"[{sid}] closed", flush=True)
 
 
 if __name__ == "__main__":
