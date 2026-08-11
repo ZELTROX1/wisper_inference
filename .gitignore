@@ -221,3 +221,5 @@ __marimo__/
 
 models/
 optimized_api/models/
+# Local CT2 weights
+models/

@@ -1,0 +1,8 @@
+faster-whisper>=1.1.0
+ctranslate2>=4.4.0
+fastapi
+uvicorn[standard]
+python-multipart
+silero-vad
+numpy
+torch
