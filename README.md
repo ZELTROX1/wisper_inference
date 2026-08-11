@@ -48,13 +48,13 @@ Headers: `sample-rate` (16000), `language` (hi)
 
 ```
 Client → binary PCM16LE mono
-Client → {"event":"finalize"}   # Pipecat VADUserStoppedSpeaking
-Client → {"event":"clear"}      # bot started speaking (drop buffer)
+Client → {"event":"finalize"}   # Pipecat VAD stop OR bot start (flush residual)
+Client → {"event":"clear"}      # rare hard reset only — do not use on bot start
 Server → {"type":"transcription","text":"...","final":true,...}
 Client → "close"
 ```
 
-No server-side Silero VAD — same pattern as Qwen3-ASR.
+No live server VAD. Pipecat owns endpoints. On bot TTS start the plugin **finalizes** residual user speech (never clear-drops it). Startup runs a silent warmup so first decode is not cold (~9s).
 
 ## Agents (techladder)
 

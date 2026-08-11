@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import time
 import wave
 from typing import List, Optional
@@ -16,6 +17,7 @@ SAMPLE_RATE = 16_000
 MIXEDCODE = "<|mixedcode|>"
 
 _model: WhisperModel | None = None
+_warmed = False
 
 
 def enable_mixedcode(model: WhisperModel) -> None:
@@ -95,6 +97,29 @@ def get_model() -> WhisperModel:
     return _model
 
 
+def warmup() -> None:
+    """Run a tiny silent decode so the first real utterance is not cold (~9s)."""
+    global _warmed
+    if _warmed:
+        return
+    # 0.5s silence @ 16 kHz
+    silence = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
+    model = get_model()
+    t0 = time.time()
+    list(
+        model.transcribe(
+            silence,
+            language="hi",
+            beam_size=1,
+            without_timestamps=True,
+            condition_on_previous_text=False,
+            vad_filter=False,
+        )[0]
+    )
+    _warmed = True
+    print(f"warmup done in {(time.time() - t0) * 1000:.0f}ms")
+
+
 def _to_float32(audio: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     if len(audio) >= 12 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE":
         with wave.open(io.BytesIO(audio), "rb") as wf:
@@ -126,6 +151,38 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def collapse_repeats(text: str, max_run: int = 2) -> str:
+    """Collapse 'पटना पटना पटना' → 'पटना पटना' (max_run copies)."""
+    words = text.split()
+    if not words:
+        return text
+    out: list[str] = []
+    prev = None
+    run = 0
+    for w in words:
+        key = w.lower()
+        if key == prev:
+            run += 1
+            if run <= max_run:
+                out.append(w)
+        else:
+            prev = key
+            run = 1
+            out.append(w)
+    return " ".join(out)
+
+
+def is_repeat_loop(text: str, ratio: float = 0.45) -> bool:
+    """True if one word dominates the transcript (Whisper loop)."""
+    words = [w.lower() for w in text.split() if w.strip()]
+    if len(words) < 6:
+        return False
+    from collections import Counter
+
+    _word, count = Counter(words).most_common(1)[0]
+    return (count / len(words)) >= ratio
+
+
 def transcribe(
     audio: bytes,
     language: str = "hi",
@@ -143,16 +200,26 @@ def transcribe(
             "good_prob": False,
         }
 
+    vad_filter = os.getenv("CLIP_VAD_FILTER", "true").lower() in ("1", "true", "yes")
+    beam = int(os.getenv("BEAM_SIZE", "5"))
+
     t0 = time.time()
     segments, _info = model.transcribe(
         wave_f,
         language=language or "hi",
         task="transcribe",
-        beam_size=int(os.getenv("BEAM_SIZE", "5")),
+        beam_size=beam,
+        temperature=0.0,
         word_timestamps=True,
         without_timestamps=True,
         condition_on_previous_text=False,
-        vad_filter=False,
+        vad_filter=vad_filter,
+        compression_ratio_threshold=float(
+            os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4")
+        ),
+        no_speech_threshold=float(os.getenv("NO_SPEECH_THRESHOLD", "0.6")),
+        repetition_penalty=float(os.getenv("REPETITION_PENALTY", "1.1")),
+        no_repeat_ngram_size=int(os.getenv("NO_REPEAT_NGRAM", "3")),
     )
     segs = list(segments)
     infer_ms = (time.time() - t0) * 1000
@@ -170,11 +237,21 @@ def transcribe(
                 w.probability is not None and float(w.probability) > 0.8 for w in s.words
             )
 
+    text = " ".join(texts).strip()
+    text = re.sub(r"\s+", " ", text.replace("\ufffd", "").replace("�", "")).strip()
+    text = collapse_repeats(text, max_run=2)
+
+    if is_repeat_loop(text):
+        # Extreme loop — keep first 3 unique-ish words only is useless; blank it.
+        print(f"repeat-loop rejected: {text[:80]!r}...")
+        text = ""
+        good = False
+
     avg = float(sum(lps) / len(lps)) if lps else 0.0
     return {
-        "text": " ".join(texts).strip(),
+        "text": text,
         "language": language,
         "avg_logprob": avg,
         "infer_ms": infer_ms,
-        "good_prob": good or (avg > -0.5 and bool(texts)),
+        "good_prob": good or (avg > -0.5 and bool(text)),
     }

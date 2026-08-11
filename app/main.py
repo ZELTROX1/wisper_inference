@@ -5,17 +5,14 @@ Endpoints
   POST /transcribe
   WS   /stream   — client-VAD protocol (Pipecat-driven)
 
-WebSocket protocol (aligned with Qwen3-ASR adapter style)
---------------------------------------------------------
+WebSocket protocol
+------------------
   Client → binary PCM16LE mono @ sample-rate (default 16 kHz)
-  Client → {"event":"finalize"}   end of utterance (Pipecat VAD stop)
-  Client → {"event":"clear"}      drop buffer without decoding (optional)
-  Client → "close"                hang up
-  Server → {"type":"transcription","text":...,"final":true,
-            "avg_logprob":...,"infer":...,"stream_id":...}
+  Client → {"event":"finalize"}   end of utterance (VAD stop OR bot start)
+  Client → {"event":"clear"}      drop buffer without decoding (rare)
+  Client → "close"
+  Server → {"type":"transcription","text":...,"final":true,...}
   Server → {"type":"error","error":...}
-
-No server-side VAD by default — Pipecat owns endpointing.
 """
 
 from __future__ import annotations
@@ -42,11 +39,19 @@ if _env.exists():
         _k, _v = _line.split("=", 1)
         os.environ.setdefault(_k.strip(), _v.strip())
 
-from app.model import SAMPLE_RATE, load_model, pcm16_to_wav, transcribe
+from app.model import (
+    SAMPLE_RATE,
+    collapse_repeats,
+    is_repeat_loop,
+    load_model,
+    pcm16_to_wav,
+    transcribe,
+    warmup,
+)
 
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKERS", "2")))
-MAX_UTTERANCE_S = float(os.getenv("MAX_UTTERANCE_S", "15"))
-MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.25"))
+MAX_UTTERANCE_S = float(os.getenv("MAX_UTTERANCE_S", "12"))
+MIN_AUDIO_S = float(os.getenv("MIN_AUDIO_S", "0.3"))
 MIN_FINAL_CHARS = int(os.getenv("MIN_FINAL_CHARS", "2"))
 LOGPROB_MIN = float(os.getenv("LOGPROB_THRESHOLD", "-0.55"))
 
@@ -54,11 +59,14 @@ LOGPROB_MIN = float(os.getenv("LOGPROB_THRESHOLD", "-0.55"))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_model()
+    # Warm CUDA kernels so first real finalize is not ~9s
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_executor, warmup)
     yield
     _executor.shutdown(wait=False)
 
 
-app = FastAPI(title="Tara STT", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Tara STT", version="1.2.0", lifespan=lifespan)
 
 
 async def _run_asr(audio: bytes, language: str, sample_rate: int = SAMPLE_RATE) -> dict:
@@ -70,7 +78,8 @@ async def _run_asr(audio: bytes, language: str, sample_rate: int = SAMPLE_RATE) 
 
 def _clean_text(text: str) -> str:
     text = text.replace("\ufffd", "").replace("�", "")
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return collapse_repeats(text, max_run=2)
 
 
 def _is_junk(text: str) -> bool:
@@ -82,6 +91,8 @@ def _is_junk(text: str) -> bool:
     words = t.split()
     if len(words) >= 4 and len(set(w.lower() for w in words)) == 1:
         return True
+    if is_repeat_loop(t):
+        return True
     low = t.lower()
     for s in ("subtitle", "sous-titrage", "thanks for watching", "www.", "subscribe"):
         if s in low:
@@ -91,7 +102,7 @@ def _is_junk(text: str) -> bool:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mode": "client_vad"}
+    return {"status": "ok", "mode": "client_vad", "version": "1.2.0"}
 
 
 @app.post("/transcribe")
@@ -104,8 +115,11 @@ async def http_transcribe(
         return {"transcription": "", "error": "empty file"}
     lang = (language or "hi").strip().lower().replace("_", "-").split("-", 1)[0]
     result = await _run_asr(data, lang)
+    text = _clean_text(result["text"])
+    if _is_junk(text):
+        text = ""
     return {
-        "transcription": _clean_text(result["text"]),
+        "transcription": text,
         "language": result["language"],
         "avg_logprob": result["avg_logprob"],
         "infer_ms": result["infer_ms"],
@@ -114,7 +128,7 @@ async def http_transcribe(
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
-    """Buffer PCM until client sends finalize (Pipecat VAD owns endpoints)."""
+    """Buffer PCM until client sends finalize (Pipecat VAD / bot-start)."""
     await ws.accept()
 
     sid = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
@@ -128,54 +142,63 @@ async def stream(ws: WebSocket):
 
     buf = bytearray()
     lock = asyncio.Lock()
+    # Serialize decodes so two finalizes don't interleave
+    decode_lock = asyncio.Lock()
 
     print(f"[{sid}] open sr={sample_rate} lang={language} mode=client_vad")
 
-    async def finalize_utterance() -> None:
+    async def finalize_utterance(reason: str = "finalize") -> None:
         nonlocal buf
-        async with lock:
-            if len(buf) < min_bytes:
-                print(f"[{sid}] finalize skipped (too short: {len(buf)} bytes)")
+        async with decode_lock:
+            async with lock:
+                if len(buf) < min_bytes:
+                    print(
+                        f"[{sid}] {reason} skipped (too short: {len(buf)} bytes)"
+                    )
+                    buf.clear()
+                    return
+                snap = bytes(buf)
                 buf.clear()
+
+            wav = pcm16_to_wav(snap, sample_rate)
+            t0 = time.time()
+            try:
+                r = await _run_asr(wav, language, sample_rate)
+            except Exception as e:
+                print(f"[{sid}] stt error: {e}")
+                try:
+                    await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
+                except Exception:
+                    pass
                 return
 
-            snap = bytes(buf)
-            buf.clear()
+            text = _clean_text(r["text"])
+            wall = (time.time() - t0) * 1000
+            print(
+                f"[{sid}] stt={text!r} lp={r['avg_logprob']:.3f} "
+                f"infer={r['infer_ms']:.0f}ms wall={wall:.0f}ms "
+                f"bytes={len(snap)} reason={reason}"
+            )
 
-        wav = pcm16_to_wav(snap, sample_rate)
-        t0 = time.time()
-        try:
-            r = await _run_asr(wav, language, sample_rate)
-        except Exception as e:
-            print(f"[{sid}] stt error: {e}")
-            await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
-            return
+            if _is_junk(text):
+                print(f"[{sid}] junk dropped reason={reason}")
+                return
+            if r["avg_logprob"] < LOGPROB_MIN and not r["good_prob"]:
+                print(f"[{sid}] low confidence dropped")
+                return
 
-        text = _clean_text(r["text"])
-        wall = (time.time() - t0) * 1000
-        print(
-            f"[{sid}] stt={text!r} lp={r['avg_logprob']:.3f} "
-            f"infer={r['infer_ms']:.0f}ms wall={wall:.0f}ms bytes={len(snap)}"
-        )
-
-        if _is_junk(text):
-            print(f"[{sid}] junk dropped")
-            return
-        if r["avg_logprob"] < LOGPROB_MIN and not r["good_prob"]:
-            print(f"[{sid}] low confidence dropped")
-            return
-
-        payload = {
-            "type": "transcription",
-            "text": text,
-            "final": True,
-            "silence_duration": 0.0,  # endpoint owned by client VAD
-            "avg_logprob": r["avg_logprob"],
-            "infer": int(r["infer_ms"]),
-            "stream_id": sid,
-        }
-        print(f"[{sid}] FINAL {text!r}")
-        await ws.send_text(json.dumps(payload))
+            payload = {
+                "type": "transcription",
+                "text": text,
+                "final": True,
+                "silence_duration": 0.0,
+                "avg_logprob": r["avg_logprob"],
+                "infer": int(r["infer_ms"]),
+                "stream_id": sid,
+                "reason": reason,
+            }
+            print(f"[{sid}] FINAL {text!r}")
+            await ws.send_text(json.dumps(payload))
 
     try:
         while True:
@@ -188,7 +211,6 @@ async def stream(ws: WebSocket):
                 async with lock:
                     buf.extend(chunk)
                     if len(buf) > max_buf:
-                        # Keep latest window only
                         buf[:] = buf[-max_buf:]
                 continue
 
@@ -200,7 +222,6 @@ async def stream(ws: WebSocket):
                     await ws.close()
                     break
 
-                # JSON control frames: {"event":"finalize"} / {"event":"clear"}
                 event = raw.lower()
                 try:
                     obj = json.loads(raw)
@@ -210,11 +231,12 @@ async def stream(ws: WebSocket):
                     pass
 
                 if event in ("finalize", "flush", "end"):
-                    await finalize_utterance()
+                    await finalize_utterance(reason=event)
                 elif event in ("clear", "reset"):
                     async with lock:
+                        n = len(buf)
                         buf.clear()
-                    print(f"[{sid}] buffer cleared")
+                    print(f"[{sid}] buffer cleared ({n} bytes dropped)")
                 else:
                     print(f"[{sid}] ignore text: {raw[:80]!r}")
                 continue
